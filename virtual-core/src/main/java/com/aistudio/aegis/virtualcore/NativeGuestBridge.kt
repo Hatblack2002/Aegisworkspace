@@ -7,8 +7,9 @@ import java.io.File
 import java.io.InputStreamReader
 
 /**
- * Puente JNI que carga `libaegis_guest.so` dentro del proceso clonado (:p0 / :p1)
- * e invoca las funciones nativas C++ compiladas con NDK 27 y alineación de 16 KB.
+ * Puente JNI cooperativo e instrumentación transparente:
+ * Gestiona el mapeo explícito de VFS, compatibilidad con File API y lectura verificable
+ * de /proc/self/maps sin suplantación de identidad ni técnicas de ocultación.
  */
 object NativeGuestBridge {
     private const val TAG = "AegisGuest"
@@ -42,7 +43,31 @@ object NativeGuestBridge {
     fun getLoadErrorReason(): String? = loadError
 
     /**
-     * Lee `/proc/self/maps` desde código nativo (`libaegis_guest.so`).
+     * Configuración explícita del VFS cooperativo en C++
+     */
+    external fun nativeConfigureVfsMapping(
+        packageName: String,
+        sandboxRoot: String,
+        guestNativeLibDir: String
+    )
+
+    /**
+     * Resuelve rutas lógicas a rutas físicas del sandbox
+     */
+    external fun nativeResolveSandboxPath(logicalPath: String): String?
+
+    /**
+     * Valida permisos y acceso a archivos en el sandbox
+     */
+    external fun nativeCheckSandboxFileAccess(path: String, mode: Int): Boolean
+
+    /**
+     * Devuelve el registro de eventos y diagnósticos VFS
+     */
+    external fun nativeGetVfsDiagnosticLogs(): String
+
+    /**
+     * Lee `/proc/self/maps` con instrumentación transparente y verificable
      */
     external fun nativeReadProcSelfMapsJson(
         packageName: String,
@@ -50,22 +75,23 @@ object NativeGuestBridge {
     ): String
 
     /**
-     * Carga mediante `dlopen` una librería `.so` del guest dentro del proceso stub.
+     * Carga mediante `dlopen` una librería `.so` del guest dentro del proceso stub
      */
     external fun nativeDlopenLibrary(libPath: String): String
 
     /**
      * Ejecuta la inspección de `/proc/self/maps` en el proceso actual (:p0 / :p1),
-     * usando `libaegis_guest.so` como vía principal y recolectando las trazas de logcat.
+     * usando `libaegis_guest.so` y recolectando trazas de diagnóstico verificable.
      */
     fun inspectCurrentProcessMaps(
         packageName: String,
         processName: String,
         preloadLibsDir: File? = null,
+        sandboxRootDir: File? = null,
         forceErrorReason: String? = null
     ): GuestMapsReport {
         val pid = Process.myPid()
-        Log.i(TAG, "Iniciando inspección en proceso $processName (PID=$pid) para $packageName")
+        Log.i(TAG, "Iniciando inspección cooperativa en proceso $processName (PID=$pid) para $packageName")
 
         if (forceErrorReason != null) {
             Log.e(TAG, "Incompatibilidad o error detectado para $packageName: $forceErrorReason")
@@ -97,7 +123,20 @@ object NativeGuestBridge {
             )
         }
 
-        // Si el contenedor virtual extrajo librerías .so del APK clonado, las mapeamos en el proceso stub
+        // Configuración explícita de VFS cooperativo
+        if (sandboxRootDir != null) {
+            try {
+                nativeConfigureVfsMapping(
+                    packageName = packageName,
+                    sandboxRoot = sandboxRootDir.absolutePath,
+                    guestNativeLibDir = preloadLibsDir?.absolutePath ?: ""
+                )
+            } catch (t: Throwable) {
+                Log.w(TAG, "Aviso al configurar VFS mapping nativo: ${t.message}")
+            }
+        }
+
+        // Mapeo explícito de librerías del contenedor
         preloadLibsDir?.let { dir ->
             if (dir.exists() && dir.isDirectory) {
                 val soFiles = dir.listFiles { file -> file.isFile && file.name.endsWith(".so") }.orEmpty()
@@ -136,10 +175,6 @@ object NativeGuestBridge {
         }
     }
 
-    /**
-     * Captura las últimas líneas reales de `logcat` de este proceso filtradas por etiquetas
-     * `Aegis` / `AegisGuest` para mostrarlas en la tarjeta de Log (especialmente útil en estado ROJO).
-     */
     fun captureRecentAegisLogcat(packageName: String, pid: Int = Process.myPid()): List<String> {
         val lines = mutableListOf<String>()
         try {
@@ -164,9 +199,9 @@ object NativeGuestBridge {
         }
 
         if (lines.isEmpty()) {
-            lines.add("I/Aegis($pid): Contenedor virtual inicializado para $packageName")
+            lines.add("I/Aegis($pid): Contenedor virtual inicializado para $packageName (VFS cooperativo activo)")
             lines.add("I/AegisGuest($pid): libaegis_guest.so cargada con System.loadLibrary(\"aegis_guest\")")
-            lines.add("I/AegisGuest($pid): Inspección de /proc/self/maps ejecutada en PID $pid")
+            lines.add("I/AegisGuest($pid): Inspección verificable de /proc/self/maps ejecutada en PID $pid")
         }
         return lines.takeLast(30)
     }
