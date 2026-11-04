@@ -62,6 +62,7 @@ fun HomeScreen(
     onLaunchClone: (ClonedAppUiItem) -> Unit,
     onRerunClone: (ClonedAppUiItem) -> Unit,
     onViewCloneResult: (ClonedAppUiItem) -> Unit,
+    onExploreFiles: (ClonedAppUiItem) -> Unit,
     onDeleteClone: (ClonedAppUiItem) -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -117,6 +118,7 @@ fun HomeScreen(
                                 onLaunchApp = onLaunchClone,
                                 onRerunApp = onRerunClone,
                                 onViewResult = onViewCloneResult,
+                                onExploreFiles = onExploreFiles,
                                 onDeleteApp = onDeleteClone,
                                 onAddAppClick = onAddAppClick
                             )

@@ -20,6 +20,7 @@ import com.aistudio.aegis.virtualcore.GuestMapsReport
 import com.example.model.UiState
 import com.example.ui.components.CloneProgressDialog
 import com.example.ui.screens.AddAppScreen
+import com.example.ui.screens.FileExplorerScreen
 import com.example.ui.screens.HomeScreen
 import com.example.ui.screens.ResultScreen
 import com.example.ui.theme.AegisTheme
@@ -41,8 +42,10 @@ object AegisRoutes {
     const val HOME = "home"
     const val ADD = "add"
     const val RESULT_PATTERN = "result/{packageName}"
+    const val FILES_PATTERN = "files/{packageName}"
 
     fun resultRoute(packageName: String): String = "result/${Uri.encode(packageName)}"
+    fun filesRoute(packageName: String): String = "files/${Uri.encode(packageName)}"
 }
 
 @Composable
@@ -133,6 +136,11 @@ fun AegisEngineApp(
                         }
                     )
                 },
+                onExploreFiles = { app ->
+                    navController.navigate(AegisRoutes.filesRoute(app.info.packageName)) {
+                        launchSingleTop = true
+                    }
+                },
                 onDeleteClone = { app ->
                     viewModel.deleteClonedApp(app.info.packageName)
                 }
@@ -211,6 +219,26 @@ fun AegisEngineApp(
                             packageName = pkg,
                             simulateReadFailure = true
                         )
+                    }
+                )
+            }
+        }
+
+        composable(
+            route = AegisRoutes.FILES_PATTERN,
+            arguments = listOf(
+                navArgument("packageName") { type = NavType.StringType }
+            )
+        ) { backStackEntry ->
+            val rawPkg = backStackEntry.arguments?.getString("packageName").orEmpty()
+            val pkg = Uri.decode(rawPkg)
+            val clonedItem = viewModel.getClonedAppUiItem(pkg)
+            if (clonedItem != null) {
+                FileExplorerScreen(
+                    clonedApp = clonedItem,
+                    viewModel = viewModel,
+                    onBackClick = {
+                        navController.popBackStack()
                     }
                 )
             }

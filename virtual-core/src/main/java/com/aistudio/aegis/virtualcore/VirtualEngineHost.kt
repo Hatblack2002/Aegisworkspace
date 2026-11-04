@@ -39,6 +39,9 @@ class VirtualEngineHost private constructor(private val appContext: Context) {
     private val _clonedApps = MutableStateFlow<List<ClonedAppInfo>>(emptyList())
     val clonedApps: StateFlow<List<ClonedAppInfo>> = _clonedApps.asStateFlow()
 
+    private val _currentStorageAudit = MutableStateFlow<VirtualStorageAudit?>(null)
+    val currentStorageAudit: StateFlow<VirtualStorageAudit?> = _currentStorageAudit.asStateFlow()
+
     init {
         loadSavedClones()
     }
@@ -163,6 +166,8 @@ class VirtualEngineHost private constructor(private val appContext: Context) {
             val nativeLibDir = File(containerDir, "lib").apply { mkdirs() }
             File(containerDir, "files").mkdirs()
             File(containerDir, "cache").mkdirs()
+            File(containerDir, "databases").mkdirs()
+            File(containerDir, "shared_prefs").mkdirs()
             File(containerDir, "oat").mkdirs()
 
             // Asignar proceso stub (:p0 o :p1) de forma determinista
@@ -389,6 +394,212 @@ class VirtualEngineHost private constructor(private val appContext: Context) {
             isAbiCompatible = true,
             incompatibilityReason = null
         )
+    }
+
+    fun getVirtualContainerDir(packageName: String): File {
+        return File(virtualRootDir, packageName).canonicalFile
+    }
+
+    /**
+     * Auditoría de archivos en el sandbox virtual (/files/virtual_env/<packageName>/).
+     * Garantiza de forma estricta que todas las rutas residan dentro del sandbox aislado.
+     */
+    suspend fun auditVirtualStorage(packageName: String): VirtualStorageAudit = withContext(Dispatchers.IO) {
+        val containerDir = File(virtualRootDir, packageName).canonicalFile
+        if (!containerDir.exists()) {
+            containerDir.mkdirs()
+        }
+        val standardFolders = listOf("files", "cache", "databases", "shared_prefs", "lib")
+        for (f in standardFolders) {
+            val sub = File(containerDir, f)
+            if (!sub.exists()) sub.mkdirs()
+        }
+
+        var totalBytes = 0L
+        var totalFiles = 0
+        var totalDirs = 0
+
+        fun exploreNode(file: File, relative: String, depth: Int): VirtualFileNode {
+            val canonical = file.canonicalFile
+            if (!canonical.path.startsWith(containerDir.path)) {
+                throw SecurityException("Acceso bloqueado: ruta fuera del sandbox virtual: ${canonical.path}")
+            }
+            val isDir = canonical.isDirectory
+            if (isDir) {
+                totalDirs++
+                val childNodes: List<VirtualFileNode> = if (depth < 6) {
+                    val rawFiles = canonical.listFiles() ?: emptyArray()
+                    val sortedList = rawFiles.sortedWith(
+                        compareBy<File> { !it.isDirectory }.thenBy { it.name.lowercase() }
+                    )
+                    sortedList.map { child ->
+                        val childRel = if (relative.isEmpty()) child.name else "$relative/${child.name}"
+                        exploreNode(child, childRel, depth + 1)
+                    }
+                } else {
+                    emptyList()
+                }
+                val dirSize = childNodes.sumOf { it.sizeBytes }
+                return VirtualFileNode(
+                    name = canonical.name,
+                    relativePath = relative.ifEmpty { canonical.name },
+                    absolutePath = canonical.absolutePath,
+                    isDirectory = true,
+                    sizeBytes = dirSize,
+                    formattedSize = VirtualFileUtils.formatSize(dirSize),
+                    lastModifiedMs = canonical.lastModified(),
+                    formattedDate = VirtualFileUtils.formatDate(canonical.lastModified()),
+                    children = childNodes,
+                    isTextPreviewable = false,
+                    previewSnippet = "${childNodes.size} elementos"
+                )
+            } else {
+                totalFiles++
+                val fileSize = canonical.length()
+                totalBytes += fileSize
+                val isText = VirtualFileUtils.isTextFile(canonical.name, fileSize)
+                val snippet = if (isText && fileSize <= 2048) {
+                    try {
+                        canonical.readText(Charsets.UTF_8).take(200)
+                    } catch (_: Exception) {
+                        null
+                    }
+                } else null
+
+                return VirtualFileNode(
+                    name = canonical.name,
+                    relativePath = relative.ifEmpty { canonical.name },
+                    absolutePath = canonical.absolutePath,
+                    isDirectory = false,
+                    sizeBytes = fileSize,
+                    formattedSize = VirtualFileUtils.formatSize(fileSize),
+                    lastModifiedMs = canonical.lastModified(),
+                    formattedDate = VirtualFileUtils.formatDate(canonical.lastModified()),
+                    children = emptyList(),
+                    isTextPreviewable = isText,
+                    previewSnippet = snippet
+                )
+            }
+        }
+
+        val rootNodes = standardFolders.map { folderName ->
+            val folderFile = File(containerDir, folderName)
+            exploreNode(folderFile, folderName, depth = 0)
+        }
+
+        val audit = VirtualStorageAudit(
+            packageName = packageName,
+            sandboxRootPath = containerDir.absolutePath,
+            rootNodes = rootNodes,
+            totalSizeBytes = totalBytes,
+            formattedTotalSize = VirtualFileUtils.formatSize(totalBytes),
+            totalFilesCount = totalFiles,
+            totalDirsCount = totalDirs
+        )
+
+        _currentStorageAudit.value = audit
+        audit
+    }
+
+    suspend fun readVirtualFileContent(
+        packageName: String,
+        relativePath: String,
+        maxBytes: Int = 128 * 1024
+    ): Result<String> = withContext(Dispatchers.IO) {
+        try {
+            val containerDir = File(virtualRootDir, packageName).canonicalFile
+            val target = File(containerDir, relativePath).canonicalFile
+            if (!target.path.startsWith(containerDir.path)) {
+                return@withContext Result.failure(SecurityException("Acceso bloqueado: ruta fuera del sandbox virtual"))
+            }
+            if (!target.exists() || target.isDirectory) {
+                return@withContext Result.failure(IllegalArgumentException("El archivo no existe o es un directorio"))
+            }
+            val text = if (target.length() > maxBytes) {
+                target.inputStream().use { stream ->
+                    val buf = ByteArray(maxBytes)
+                    val read = stream.read(buf)
+                    String(buf, 0, read, Charsets.UTF_8) + "\n\n[... Truncado a 128 KB ...]"
+                }
+            } else {
+                target.readText(Charsets.UTF_8)
+            }
+            Result.success(text)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun createSampleVerificationFile(
+        packageName: String,
+        targetFolder: String = "shared_prefs",
+        fileName: String = "app_preferences.xml",
+        customContent: String? = null
+    ): Result<VirtualFileNode> = withContext(Dispatchers.IO) {
+        try {
+            val containerDir = File(virtualRootDir, packageName).canonicalFile
+            val folder = File(containerDir, targetFolder).canonicalFile
+            if (!folder.path.startsWith(containerDir.path)) {
+                return@withContext Result.failure(SecurityException("Ruta no autorizada"))
+            }
+            folder.mkdirs()
+            val targetFile = File(folder, fileName).canonicalFile
+            if (!targetFile.path.startsWith(containerDir.path)) {
+                return@withContext Result.failure(SecurityException("Ruta no autorizada"))
+            }
+
+            val content = customContent ?: """<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
+<map>
+    <string name="aegis_verification">sandbox_vfs_ok</string>
+    <string name="target_package">$packageName</string>
+    <boolean name="virtualization_active" value="true" />
+    <long name="created_timestamp_ms" value="${System.currentTimeMillis()}" />
+    <string name="environment">isolated_virtual_sandbox</string>
+</map>
+""".trimIndent()
+
+            targetFile.writeText(content, Charsets.UTF_8)
+            auditVirtualStorage(packageName)
+
+            val node = VirtualFileNode(
+                name = targetFile.name,
+                relativePath = "$targetFolder/$fileName",
+                absolutePath = targetFile.absolutePath,
+                isDirectory = false,
+                sizeBytes = targetFile.length(),
+                formattedSize = VirtualFileUtils.formatSize(targetFile.length()),
+                lastModifiedMs = targetFile.lastModified(),
+                formattedDate = VirtualFileUtils.formatDate(targetFile.lastModified()),
+                children = emptyList(),
+                isTextPreviewable = true,
+                previewSnippet = content.take(150)
+            )
+            Result.success(node)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun deleteVirtualFile(packageName: String, relativePath: String): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            val containerDir = File(virtualRootDir, packageName).canonicalFile
+            val target = File(containerDir, relativePath).canonicalFile
+            if (!target.path.startsWith(containerDir.path)) {
+                return@withContext Result.failure(SecurityException("Ruta no autorizada"))
+            }
+            if (!target.exists()) {
+                return@withContext Result.failure(IllegalArgumentException("El archivo no existe"))
+            }
+            val deleted = if (target.isDirectory) {
+                target.deleteRecursively()
+            } else {
+                target.delete()
+            }
+            auditVirtualStorage(packageName)
+            Result.success(deleted)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
     }
 
     companion object {

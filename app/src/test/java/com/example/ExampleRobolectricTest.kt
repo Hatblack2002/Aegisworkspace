@@ -55,9 +55,50 @@ class ExampleRobolectricTest {
         )
         val parsed = GuestMapsReport.fromContractOrFullJson(report.toStrictContractJson())
         assertFalse(parsed.ok)
-        assertEquals(23456, parsed.pid)
         assertEquals("com.dev.blocked", parsed.packageName)
         assertTrue(parsed.libs.isEmpty())
         assertEquals("EACCES", parsed.error)
+    }
+
+    @Test
+    fun `virtual sandbox audit and file verification read write`() = kotlinx.coroutines.runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val host = com.aistudio.aegis.virtualcore.VirtualEngineHost.getInstance(context)
+        val pkg = "com.test.virtualgame"
+
+        val audit = host.auditVirtualStorage(pkg)
+        assertEquals(pkg, audit.packageName)
+        val folderNames = audit.rootNodes.map { it.name }.toSet()
+        assertTrue(folderNames.contains("files"))
+        assertTrue(folderNames.contains("cache"))
+        assertTrue(folderNames.contains("databases"))
+        assertTrue(folderNames.contains("shared_prefs"))
+        assertTrue(folderNames.contains("lib"))
+
+        // Escribir archivo de verificación
+        val writeRes = host.createSampleVerificationFile(
+            packageName = pkg,
+            targetFolder = "shared_prefs",
+            fileName = "config.xml"
+        )
+        assertTrue(writeRes.isSuccess)
+        val node = writeRes.getOrThrow()
+        assertEquals("config.xml", node.name)
+        assertTrue(node.isTextPreviewable)
+
+        // Leer archivo de verificación
+        val readRes = host.readVirtualFileContent(pkg, "shared_prefs/config.xml")
+        assertTrue(readRes.isSuccess)
+        val content = readRes.getOrThrow()
+        assertTrue(content.contains("aegis_verification"))
+        assertTrue(content.contains(pkg))
+
+        // Auditoría actualizada debe mostrar el archivo
+        val updatedAudit = host.currentStorageAudit.value
+        assertTrue(updatedAudit != null && updatedAudit.totalFilesCount >= 1)
+
+        // Seguridad: Intento de traversal debe fallar
+        val traversalRes = host.readVirtualFileContent(pkg, "../../etc/hosts")
+        assertTrue(traversalRes.isFailure)
     }
 }

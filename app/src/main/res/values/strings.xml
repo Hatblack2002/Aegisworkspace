@@ -33,4 +33,10 @@
     <string name="cd_status_red">Semáforo rojo: fallo de lectura</string>
     <string name="toast_crash_isolated">La app se cerró inesperadamente</string>
     <string name="error_stub_crashed">La app clonada se cerró inesperadamente en su proceso aislado. Aegis Engine sigue operativo.</string>
+    <string name="menu_explore_files">Explorador de archivos</string>
+    <string name="files_screen_title">Archivos virtuales</string>
+    <string name="files_screen_subtitle">Estructura real del sandbox de la app</string>
+    <string name="files_create_sample">Crear archivo de prueba</string>
+    <string name="files_empty_dir">Directorio vacío</string>
+    <string name="files_preview_title">Visor de archivo</string>
 </resources>

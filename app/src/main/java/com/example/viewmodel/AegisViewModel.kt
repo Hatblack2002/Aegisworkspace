@@ -17,6 +17,8 @@ import androidx.lifecycle.viewModelScope
 import com.aistudio.aegis.virtualcore.ClonedAppInfo
 import com.aistudio.aegis.virtualcore.GuestMapsReport
 import com.aistudio.aegis.virtualcore.VirtualEngineHost
+import com.aistudio.aegis.virtualcore.VirtualFileNode
+import com.aistudio.aegis.virtualcore.VirtualStorageAudit
 import com.example.model.ClonedAppUiItem
 import com.example.model.InstalledAppItem
 import com.example.model.UiState
@@ -51,6 +53,17 @@ class AegisViewModel(application: Application) : AndroidViewModel(application) {
     val selectedPackageToClone: StateFlow<String?> = _selectedPackageToClone.asStateFlow()
 
     val crashEvent: StateFlow<Pair<String, String>?> = com.aistudio.aegis.virtualcore.AegisReportProvider.crashEvents
+
+    val currentStorageAudit: StateFlow<VirtualStorageAudit?> = engineHost.currentStorageAudit
+
+    private val _selectedFileContent = MutableStateFlow<Pair<VirtualFileNode, String>?>(null)
+    val selectedFileContent: StateFlow<Pair<VirtualFileNode, String>?> = _selectedFileContent.asStateFlow()
+
+    private val _fileOperationMessage = MutableStateFlow<String?>(null)
+    val fileOperationMessage: StateFlow<String?> = _fileOperationMessage.asStateFlow()
+
+    private val _isFilesLoading = MutableStateFlow(false)
+    val isFilesLoading: StateFlow<Boolean> = _isFilesLoading.asStateFlow()
 
     fun clearCrashEvent() {
         com.aistudio.aegis.virtualcore.AegisReportProvider.clearCrashEvent()
@@ -327,5 +340,77 @@ class AegisViewModel(application: Application) : AndroidViewModel(application) {
         drawable.setBounds(0, 0, canvas.width, canvas.height)
         drawable.draw(canvas)
         return bitmap
+    }
+
+    /**
+     * Carga y refresca la estructura de directorios del sandbox de la app clonada.
+     */
+    fun loadVirtualStorageAudit(packageName: String) {
+        viewModelScope.launch {
+            _isFilesLoading.value = true
+            try {
+                engineHost.auditVirtualStorage(packageName)
+            } finally {
+                _isFilesLoading.value = false
+            }
+        }
+    }
+
+    /**
+     * Selecciona un archivo para visor de contenido seguro.
+     */
+    fun selectFileForPreview(node: VirtualFileNode, packageName: String) {
+        viewModelScope.launch {
+            if (node.isDirectory) return@launch
+            val contentResult = engineHost.readVirtualFileContent(packageName, node.relativePath)
+            val content = contentResult.getOrElse { it.message ?: "No se pudo leer el archivo" }
+            _selectedFileContent.value = Pair(node, content)
+        }
+    }
+
+    fun closeFilePreview() {
+        _selectedFileContent.value = null
+    }
+
+    /**
+     * Verificación de Escritura: Crea un archivo de prueba (ej. config.xml) dentro del sandbox.
+     */
+    fun createSampleVerificationFile(
+        packageName: String,
+        targetFolder: String = "shared_prefs",
+        fileName: String = "config.xml"
+    ) {
+        viewModelScope.launch {
+            val res = engineHost.createSampleVerificationFile(
+                packageName = packageName,
+                targetFolder = targetFolder,
+                fileName = fileName
+            )
+            if (res.isSuccess) {
+                _fileOperationMessage.value = "Archivo creado: $targetFolder/$fileName"
+                // Seleccionarlo inmediatamente para vista previa
+                selectFileForPreview(res.getOrThrow(), packageName)
+            } else {
+                _fileOperationMessage.value = "Error al crear: ${res.exceptionOrNull()?.message}"
+            }
+        }
+    }
+
+    fun deleteFile(packageName: String, relativePath: String) {
+        viewModelScope.launch {
+            val res = engineHost.deleteVirtualFile(packageName, relativePath)
+            if (res.isSuccess) {
+                _fileOperationMessage.value = "Elemento eliminado: $relativePath"
+                if (_selectedFileContent.value?.first?.relativePath == relativePath) {
+                    _selectedFileContent.value = null
+                }
+            } else {
+                _fileOperationMessage.value = "Error al eliminar: ${res.exceptionOrNull()?.message}"
+            }
+        }
+    }
+
+    fun clearFileOperationMessage() {
+        _fileOperationMessage.value = null
     }
 }
