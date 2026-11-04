@@ -284,6 +284,28 @@ class VirtualEngineHost private constructor(private val appContext: Context) {
     }
 
     /**
+     * Virtual Activity Launcher: Abre la app clonada en pantalla completa dentro de su proceso stub aislado.
+     */
+    fun launchClonedAppFullscreenActivity(clonedApp: ClonedAppInfo) {
+        val activityClass = if (clonedApp.assignedProcess == ":p1") {
+            StubProcessActivityP1::class.java
+        } else {
+            StubProcessActivityP0::class.java
+        }
+
+        val activityIntent = Intent(appContext, activityClass).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_MULTIPLE_TASK)
+            putExtra(GuestRuntimeEngine.EXTRA_PACKAGE_NAME, clonedApp.packageName)
+            putExtra(GuestRuntimeEngine.EXTRA_APK_PATH, clonedApp.sourceApkPath)
+            putExtra(GuestRuntimeEngine.EXTRA_CONTAINER_DIR, clonedApp.virtualContainerDir)
+            putExtra(GuestRuntimeEngine.EXTRA_NATIVE_LIB_DIR, clonedApp.virtualNativeLibDir)
+            putExtra(GuestRuntimeEngine.EXTRA_PROCESS_NAME, clonedApp.assignedProcess)
+            putExtra(GuestRuntimeEngine.EXTRA_LAUNCH_UI, true)
+        }
+        appContext.startActivity(activityIntent)
+    }
+
+    /**
      * Elimina un clon del contenedor virtual y borra sus archivos aislados.
      */
     suspend fun removeClonedApp(packageName: String) = withContext(Dispatchers.IO) {

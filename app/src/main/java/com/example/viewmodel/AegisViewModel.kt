@@ -221,6 +221,15 @@ class AegisViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /**
+     * Virtual Activity Launcher: Lanza la app clonada visualmente en pantalla completa en el proceso stub.
+     */
+    fun launchFullscreenClonedApp(packageName: String) {
+        val existing = _clonedApps.value.find { it.info.packageName == packageName }?.info ?: return
+        engineHost.launchClonedAppFullscreenActivity(existing)
+    }
+
+
     private suspend fun executeCloneProcess(
         clonedInfo: ClonedAppInfo,
         simulateReadFailure: Boolean,

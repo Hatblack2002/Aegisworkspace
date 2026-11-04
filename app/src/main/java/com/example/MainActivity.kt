@@ -99,15 +99,7 @@ fun AegisEngineApp(
                     navController.navigate(AegisRoutes.ADD)
                 },
                 onLaunchClone = { app ->
-                    viewModel.launchOrRerunClonedApp(
-                        packageName = app.info.packageName,
-                        simulateReadFailure = false,
-                        onNavigateToResult = { pkg ->
-                            navController.navigate(AegisRoutes.resultRoute(pkg)) {
-                                launchSingleTop = true
-                            }
-                        }
-                    )
+                    viewModel.launchFullscreenClonedApp(app.info.packageName)
                 },
                 onRerunClone = { app ->
                     viewModel.launchOrRerunClonedApp(
