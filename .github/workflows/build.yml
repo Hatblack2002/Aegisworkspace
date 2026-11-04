@@ -33,8 +33,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          yes | sdkmanager --sdk_root="$ANDROID_HOME" --licenses >/dev/null
-          sdkmanager --sdk_root="$ANDROID_HOME" --install "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358" "cmake;3.22.1"
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager | sort -V | tail -n 1)"
+          test -x "$SDKMANAGER"
+          set +o pipefail
+          yes | "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --licenses >/dev/null
+          set -o pipefail
+          "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --install "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358" "cmake;3.22.1"
 
       - name: Build debug APK
         run: gradle --no-daemon --stacktrace :app:assembleDebug
