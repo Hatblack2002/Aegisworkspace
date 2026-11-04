@@ -29,11 +29,12 @@ jobs:
         with:
           gradle-version: "9.3.1"
 
-      - name: Set up Android SDK and NDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android build packages
-        run: sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358" "cmake;3.22.1"
+      - name: Install Android SDK, NDK and CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --sdk_root="$ANDROID_HOME" --licenses >/dev/null
+          sdkmanager --sdk_root="$ANDROID_HOME" --install "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358" "cmake;3.22.1"
 
       - name: Build debug APK
         run: gradle --no-daemon --stacktrace :app:assembleDebug
