@@ -7,6 +7,7 @@
 #include <dlfcn.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <string>
 #include <vector>
 #include <set>
@@ -36,6 +37,33 @@ struct RedirectionEvent {
 
 std::vector<RedirectionEvent> g_eventHistory;
 const size_t MAX_HISTORY_EVENTS = 50;
+
+// Estructuras para manejo de señales en Sandbox
+struct sigaction g_oldSegv;
+struct sigaction g_oldAbrt;
+struct sigaction g_oldBus;
+struct sigaction g_oldIll;
+struct sigaction g_oldFpe;
+bool g_crashHandlerInstalled = false;
+
+void nativeCrashSignalHandler(int sig, siginfo_t* info, void* context) {
+    const char* sigName = "UNKNOWN";
+    switch (sig) {
+        case SIGSEGV: sigName = "SIGSEGV (Segmentation Fault)"; break;
+        case SIGABRT: sigName = "SIGABRT (Abort)"; break;
+        case SIGBUS:  sigName = "SIGBUS (Bus Error)"; break;
+        case SIGILL:  sigName = "SIGILL (Illegal Instruction)"; break;
+        case SIGFPE:  sigName = "SIGFPE (Floating Point Exception)"; break;
+    }
+
+    void* faultAddr = info ? info->si_addr : nullptr;
+    pid_t pid = getpid();
+    LOGE("CRASH DETECTADO EN PROCESO STUB (PID=%d, SEÑAL=%d: %s, ADDR=%p)", pid, sig, sigName, faultAddr);
+    LOGE("Aegis Crash Sandbox aislando fallo: terminando únicamente el proceso stub :p0/:p1 para proteger Aegis Host.");
+
+    // Terminar inmediatamente el proceso stub con _exit para no arrastrar al proceso anfitrión
+    _exit(128 + sig);
+}
 
 std::string escapeJsonString(const std::string& input) {
     std::ostringstream ss;
@@ -129,6 +157,35 @@ JNI_OnLoad(JavaVM* vm, void* /*reserved*/) {
 }
 
 /**
+ * Instalación del Crash Handler nativo (SIGSEGV, SIGABRT, SIGBUS, SIGILL, SIGFPE).
+ * Asegura que cualquier fallo o aborto nativo de la app clonada sea contenido en su propio
+ * proceso (:p0 o :p1) y no arrastre ni bloquee al proceso principal de Aegis Engine.
+ */
+extern "C" JNIEXPORT void JNICALL
+Java_com_aistudio_aegis_virtualcore_NativeGuestBridge_nativeInstallCrashHandler(
+        JNIEnv* /*env*/,
+        jobject /*thiz*/) {
+    if (g_crashHandlerInstalled) {
+        return;
+    }
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = nativeCrashSignalHandler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+
+    sigaction(SIGSEGV, &sa, &g_oldSegv);
+    sigaction(SIGABRT, &sa, &g_oldAbrt);
+    sigaction(SIGBUS,  &sa, &g_oldBus);
+    sigaction(SIGILL,  &sa, &g_oldIll);
+    sigaction(SIGFPE,  &sa, &g_oldFpe);
+
+    g_crashHandlerInstalled = true;
+    LOGI("Aegis Crash Sandbox nativo instalado correctamente en PID=%d", getpid());
+}
+
+/**
  * Configuración explícita del VFS Cooperativo:
  * Mapeo entre las rutas lógicas del paquete huésped (/data/data/<pkg>) y la ruta física del sandbox de Aegis.
  */
@@ -160,7 +217,7 @@ Java_com_aistudio_aegis_virtualcore_NativeGuestBridge_nativeConfigureVfsMapping(
 
 /**
  * Adaptador cooperativo para File APIs:
- * Resuelve la ruta lógica a la ruta real del sandbox de forma verificable y ejecuta compatibilidad
+ * Resuelve la ruta lógica a la ruta real del sandbox de forma transparente y ejecuta compatibilidad
  * con fopen, access y stat, registrando la operación en el diagnóstico.
  */
 extern "C" JNIEXPORT jstring JNICALL

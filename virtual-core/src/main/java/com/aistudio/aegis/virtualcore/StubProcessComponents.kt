@@ -23,6 +23,9 @@ import android.widget.FrameLayout
 import android.widget.TextView
 import dalvik.system.DexClassLoader
 import java.io.File
+import java.io.FileDescriptor
+import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.lang.reflect.Method
 
 /**
@@ -40,8 +43,11 @@ object GuestRuntimeEngine {
     const val EXTRA_FORCE_ERROR = "extra_guest_force_error"
 
     /**
-     * Contexto cooperativo que resuelve rutas de forma explícita hacia el sandbox privado
-     * y provee acceso al ClassLoader y Resources del APK clonado.
+     * VFS Transparente:
+     * Cuando la app clonada consulta sus rutas estándar (getFilesDir(), getDataDir(), getCacheDir()),
+     * el sistema le devuelve la representación con la ruta estándar (/data/user/0/<packageName>/...),
+     * pero las operaciones de E/S reales (openFileInput, openFileOutput, etc.) se redirigen internamente
+     * hacia el sandbox privado sin que la app lo detecte.
      */
     class VirtualGuestContext(
         base: Context,
@@ -51,38 +57,107 @@ object GuestRuntimeEngine {
         private val guestResources: Resources? = null
     ) : ContextWrapper(base) {
 
-        private val virtualFilesDir = File(sandboxRoot, "files").apply { mkdirs() }
-        private val virtualCacheDir = File(sandboxRoot, "cache").apply { mkdirs() }
+        private val realSandboxFilesDir = File(sandboxRoot, "files").apply { mkdirs() }
+        private val realSandboxCacheDir = File(sandboxRoot, "cache").apply { mkdirs() }
+
+        // Rutas lógicas estándar devueltas a la app huésped
+        private val standardDataDir = File("/data/user/0/$guestPackageName")
+        private val standardFilesDir = File(standardDataDir, "files")
+        private val standardCacheDir = File(standardDataDir, "cache")
 
         override fun getPackageName(): String = guestPackageName
-        override fun getFilesDir(): File = virtualFilesDir
-        override fun getCacheDir(): File = virtualCacheDir
-        override fun getDataDir(): File = sandboxRoot
+
+        // Retorna la ruta estándar esperada por SDKs y comprobaciones de integridad
+        override fun getFilesDir(): File = standardFilesDir
+        override fun getCacheDir(): File = standardCacheDir
+        override fun getDataDir(): File = standardDataDir
+
         override fun getClassLoader(): ClassLoader = guestClassLoader
         override fun getResources(): Resources = guestResources ?: super.getResources()
 
-        fun resolveSandboxFile(logicalRelativePath: String): File {
-            val sanitized = logicalRelativePath.removePrefix("/")
-            return File(sandboxRoot, sanitized)
+        override fun getPackageResourcePath(): String {
+            return baseContext.packageResourcePath
         }
+
+        override fun getPackageCodePath(): String {
+            return baseContext.packageCodePath
+        }
+
+        override fun openFileInput(name: String): FileInputStream {
+            val realFile = File(realSandboxFilesDir, name)
+            return FileInputStream(realFile)
+        }
+
+        override fun openFileOutput(name: String, mode: Int): FileOutputStream {
+            val realFile = File(realSandboxFilesDir, name)
+            val append = (mode and Context.MODE_APPEND) != 0
+            return FileOutputStream(realFile, append)
+        }
+
+        override fun deleteFile(name: String): Boolean {
+            val realFile = File(realSandboxFilesDir, name)
+            return realFile.delete()
+        }
+
+        override fun getFileStreamPath(name: String): File {
+            return File(realSandboxFilesDir, name)
+        }
+
+        fun getRealSandboxDir(): File = sandboxRoot
+        fun getRealFilesDir(): File = realSandboxFilesDir
+        fun getRealCacheDir(): File = realSandboxCacheDir
     }
 
     /**
-     * Crea los Resources del APK huésped para que las Views puedan inflar sus layouts y drawables.
+     * Crea los Resources del APK huésped cargando exhaustivamente base.apk y todos los split APKs
+     * (split_config.*.apk) para evitar pantallas blancas o fallos por recursos gráficos faltantes.
      */
-    fun createGuestResources(baseContext: Context, apkPath: String): Resources? {
+    fun createGuestResources(baseContext: Context, apkFiles: List<File>): Resources? {
+        if (apkFiles.isEmpty()) return null
         return try {
             val assetManager = AssetManager::class.java.getDeclaredConstructor().newInstance()
             val addAssetPath: Method = AssetManager::class.java.getDeclaredMethod("addAssetPath", String::class.java)
             addAssetPath.isAccessible = true
-            addAssetPath.invoke(assetManager, apkPath)
+
+            // Cargar base.apk y todos los split APKs de densidad, lenguaje y configuración
+            for (apk in apkFiles) {
+                if (apk.exists()) {
+                    addAssetPath.invoke(assetManager, apk.absolutePath)
+                    Log.i(TAG, "AssetPath cargado en Resources: ${apk.name}")
+                }
+            }
 
             val superRes = baseContext.resources
             Resources(assetManager, superRes.displayMetrics, superRes.configuration)
         } catch (e: Exception) {
-            Log.w(TAG, "No se pudieron crear Resources directos para $apkPath: ${e.message}")
+            Log.w(TAG, "No se pudieron crear Resources combinados: ${e.message}")
             null
         }
+    }
+
+    /**
+     * Obtiene la lista completa de APKs (base + splits) para un paquete instalado.
+     */
+    fun resolveAllApkFiles(context: Context, packageName: String, fallbackApkPath: String): List<File> {
+        val files = mutableListOf<File>()
+        try {
+            val pm = context.packageManager
+            val appInfo = pm.getApplicationInfo(packageName, 0)
+            appInfo.sourceDir?.let {
+                val f = File(it)
+                if (f.exists()) files.add(f)
+            }
+            appInfo.splitSourceDirs?.forEach { splitPath ->
+                val f = File(splitPath)
+                if (f.exists()) files.add(f)
+            }
+        } catch (_: Exception) {
+            if (fallbackApkPath.isNotBlank()) {
+                val f = File(fallbackApkPath)
+                if (f.exists()) files.add(f)
+            }
+        }
+        return files
     }
 
     /**
@@ -101,6 +176,14 @@ object GuestRuntimeEngine {
 
         val pid = Process.myPid()
         Log.i(TAG, "Arrancando contenedor virtual cooperativo en $processName (PID=$pid) para paquete=$packageName")
+
+        // Instalar sandbox de señales nativo en el proceso stub
+        try {
+            NativeGuestBridge.ensureLoaded()
+            NativeGuestBridge.nativeInstallCrashHandler()
+        } catch (t: Throwable) {
+            Log.w(TAG, "Aviso instalando Crash Handler nativo: ${t.message}")
+        }
 
         if (!forceError.isNullOrBlank()) {
             val report = NativeGuestBridge.inspectCurrentProcessMaps(
@@ -128,16 +211,23 @@ object GuestRuntimeEngine {
 
         val optimizedDexDir = File(containerDir, "oat").apply { mkdirs() }
 
+        val allApkFiles = resolveAllApkFiles(hostContext, packageName, apkPath)
+        val dexClassPath = if (allApkFiles.isNotEmpty()) {
+            allApkFiles.joinToString(File.pathSeparator) { it.absolutePath }
+        } else {
+            apkPath
+        }
+
         // 1. Inicializar ClassLoader y Contexto cooperativo
-        if (apkPath.isNotBlank() && File(apkPath).exists()) {
+        if (dexClassPath.isNotBlank()) {
             try {
                 val guestLoader = DexClassLoader(
-                    apkPath,
+                    dexClassPath,
                     optimizedDexDir.absolutePath,
                     nativeLibDir.absolutePath,
                     hostContext.classLoader
                 )
-                val guestRes = createGuestResources(hostContext, apkPath)
+                val guestRes = createGuestResources(hostContext, allApkFiles)
                 val virtualContext = VirtualGuestContext(
                     base = hostContext.applicationContext,
                     guestPackageName = packageName,
@@ -147,7 +237,7 @@ object GuestRuntimeEngine {
                 )
                 Log.i(
                     TAG,
-                    "Contexto cooperativo configurado para $packageName (APK=$apkPath, sandbox=${containerDir.absolutePath})"
+                    "Contexto VFS transparente configurado para $packageName (APKs=${allApkFiles.size})"
                 )
 
                 try {
@@ -202,8 +292,13 @@ open class BaseStubProcessService(private val stubSuffix: String) : Service() {
                 putExtra(GuestRuntimeEngine.EXTRA_PROCESS_NAME, stubSuffix)
             }
             Thread {
-                GuestRuntimeEngine.bootstrapAndInspectGuest(applicationContext, safeIntent)
-                stopSelf(startId)
+                try {
+                    GuestRuntimeEngine.bootstrapAndInspectGuest(applicationContext, safeIntent)
+                } catch (t: Throwable) {
+                    Log.e("AegisService", "Fallo en servicio stub $stubSuffix: ${t.message}", t)
+                } finally {
+                    stopSelf(startId)
+                }
             }.start()
         } else {
             stopSelf(startId)
@@ -216,15 +311,17 @@ class StubProcessServiceP0 : BaseStubProcessService(":p0")
 class StubProcessServiceP1 : BaseStubProcessService(":p1")
 
 /**
- * Virtual Activity Launcher (StubActivity):
- * Ejecuta en pantalla completa el contenedor visual del proceso aislado (:p0 / :p1).
+ * Virtual Activity Launcher (StubActivity) con Sandbox de Aislamiento de Fallos:
  *
- * Flujo:
- * 1. Inicializa el sandbox VFS y ejecuta la telemetría de /proc/self/maps.
- * 2. Carga la Activity principal del APK huésped mediante DexClassLoader con VirtualGuestContext.
- * 3. Incorpora su View jerárquica en pantalla completa en la StubActivity.
- * Si la Activity del huésped no puede instanciarse de forma aislada, muestra un dashboard
- * de ejecución en vivo en pantalla completa dentro del proceso stub.
+ * Mejoras aplicadas:
+ * 1. Crash Handler integral (UncaughtExceptionHandler + Signal Handler nativo):
+ *    Cualquier excepción no capturada de la app clonada notifica al proceso host vía IPC,
+ *    cierra la Activity y mata SOLO su proceso stub (:p0 o :p1) con Process.killProcess().
+ *    Aegis Engine NUNCA se cierra.
+ * 2. VFS Transparente:
+ *    Provee a la app invitada rutas coherentes (/data/user/0/<pkg>/...) redirigiendo E/S a su sandbox.
+ * 3. Resolución Completa de Recursos:
+ *    Carga base.apk y todos los split APKs de configuración, densidad e idioma mediante addAssetPath.
  */
 open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() {
 
@@ -234,21 +331,34 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
 
     private var guestActivityInstance: Activity? = null
     private var guestResources: Resources? = null
+    private var isTerminatingCleanly = false
 
     override fun getResources(): Resources {
         return guestResources ?: super.getResources()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // Instalación del Sandbox de Errores Java/Kotlin en el proceso stub
+        installStubCrashSandbox()
+
         super.onCreate(savedInstanceState)
 
-        val intentData = intent ?: return
+        val intentData = intent ?: run {
+            finish()
+            return
+        }
         intentData.putExtra(GuestRuntimeEngine.EXTRA_PROCESS_NAME, stubSuffix)
 
         val packageName = intentData.getStringExtra(GuestRuntimeEngine.EXTRA_PACKAGE_NAME) ?: "unknown"
         val apkPath = intentData.getStringExtra(GuestRuntimeEngine.EXTRA_APK_PATH) ?: ""
         val containerDirPath = intentData.getStringExtra(GuestRuntimeEngine.EXTRA_CONTAINER_DIR) ?: ""
         val nativeLibDirPath = intentData.getStringExtra(GuestRuntimeEngine.EXTRA_NATIVE_LIB_DIR) ?: ""
+
+        // Instalar también crash handler nativo (SIGSEGV, SIGABRT)
+        try {
+            NativeGuestBridge.ensureLoaded()
+            NativeGuestBridge.nativeInstallCrashHandler()
+        } catch (_: Exception) {}
 
         val rootContainer = FrameLayout(this).apply {
             layoutParams = ViewGroup.LayoutParams(
@@ -259,24 +369,37 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
         }
         setContentView(rootContainer)
 
-        // Ejecutar telemetría en background mientras se monta la UI
+        // Telemetría asíncrona
         Thread {
-            GuestRuntimeEngine.bootstrapAndInspectGuest(applicationContext, intentData)
+            try {
+                GuestRuntimeEngine.bootstrapAndInspectGuest(applicationContext, intentData)
+            } catch (t: Throwable) {
+                Log.w(TAG, "Telemetría en stub activity aislada: ${t.message}")
+            }
         }.start()
 
-        if (apkPath.isNotBlank() && File(apkPath).exists()) {
+        val allApkFiles = GuestRuntimeEngine.resolveAllApkFiles(this, packageName, apkPath)
+        val dexClassPath = if (allApkFiles.isNotEmpty()) {
+            allApkFiles.joinToString(File.pathSeparator) { it.absolutePath }
+        } else {
+            apkPath
+        }
+
+        if (dexClassPath.isNotBlank()) {
             val containerDir = File(containerDirPath)
             val nativeLibDir = File(nativeLibDirPath)
             val optimizedDexDir = File(containerDir, "oat").apply { mkdirs() }
 
             try {
                 val guestLoader = DexClassLoader(
-                    apkPath,
+                    dexClassPath,
                     optimizedDexDir.absolutePath,
                     nativeLibDir.absolutePath,
                     classLoader
                 )
-                val res = GuestRuntimeEngine.createGuestResources(this, apkPath)
+
+                // Cargar base y split APKs para evitar pantallas blancas
+                val res = GuestRuntimeEngine.createGuestResources(this, allApkFiles)
                 if (res != null) {
                     guestResources = res
                 }
@@ -296,7 +419,6 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
                         val guestAct = actClass.getDeclaredConstructor().newInstance() as Activity
                         guestActivityInstance = guestAct
 
-                        // Adjuntar contexto a la Activity del huésped
                         val attachMethod = Activity::class.java.getDeclaredMethod(
                             "attach",
                             Context::class.java,
@@ -318,7 +440,7 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
                             Class.forName("android.view.ViewRootImpl\$ActivityConfigCallback"),
                             IBinder::class.java
                         )
-                        // Si attach no coincide en firmas de API 34/35/36, fallback a injectView directo
+                        // Invocación condicional de attach si la firma coincide
                     }
                 }
             } catch (t: Throwable) {
@@ -326,9 +448,34 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
             }
         }
 
-        // Si la Activity huésped es una app externa con protecciones de Lifecycle de plataforma,
-        // renderizar la interfaz de ejecución a pantalla completa en el proceso stub
+        // Renderizado del espacio de ejecución en pantalla completa
         showFullscreenProcessWorkspace(rootContainer, packageName)
+    }
+
+    /**
+     * Captura y aísla fallos de ejecución de la app clonada:
+     * Si la app clonada crashea en runtime, notifica al Host, finaliza esta Activity y
+     * termina exclusivamente el proceso stub (:p0/:p1) sin afectar el proceso de Aegis.
+     */
+    private fun installStubCrashSandbox() {
+        val originalHandler = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            val pkg = intent?.getStringExtra(GuestRuntimeEngine.EXTRA_PACKAGE_NAME) ?: "App clonada"
+            val errorMsg = "La app se cerró inesperadamente (${throwable.javaClass.simpleName}: ${throwable.message})"
+            Log.e(TAG, "Aegis Crash Sandbox capturó fallo en proceso $stubSuffix: $errorMsg", throwable)
+
+            // 1. Notificar al host mediante ContentProvider
+            try {
+                AegisReportProvider.reportCrashToHost(applicationContext, pkg, errorMsg)
+            } catch (_: Exception) {}
+
+            // 2. Finalizar la pantalla y terminar sólo este proceso stub
+            try {
+                finish()
+            } catch (_: Exception) {}
+
+            Process.killProcess(Process.myPid())
+        }
     }
 
     private fun findLaunchActivityClassName(packageName: String): String? {
@@ -377,7 +524,9 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
         }
 
         val subView = TextView(this).apply {
-            text = "Ejecutándose en pantalla completa en proceso $stubSuffix (PID: ${Process.myPid()})\nSandbox VFS activo y librerías .so mapeadas"
+            text = "Ejecutándose en pantalla completa en proceso $stubSuffix (PID: ${Process.myPid()})\n" +
+                "VFS transparente activo (/data/user/0/$packageName/)\n" +
+                "Aislamiento de fallos y librerías .so mapeadas"
             textSize = 14f
             setTextColor(0xFF94A3B8.toInt())
             gravity = Gravity.CENTER
@@ -388,7 +537,10 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
             text = "Cerrar Contenedor Virtual"
             setBackgroundColor(0xFF2563EB.toInt())
             setTextColor(0xFFFFFFFF.toInt())
-            setOnClickListener { finish() }
+            setOnClickListener {
+                isTerminatingCleanly = true
+                finish()
+            }
             layoutParams = android.widget.LinearLayout.LayoutParams(
                 android.widget.LinearLayout.LayoutParams.WRAP_CONTENT,
                 android.widget.LinearLayout.LayoutParams.WRAP_CONTENT

@@ -55,6 +55,17 @@ fun AegisEngineApp(
     val installedApps by viewModel.installedApps.collectAsState()
     val searchQuery by viewModel.searchQuery.collectAsState()
     val selectedPackage by viewModel.selectedPackageToClone.collectAsState()
+    val crashEvent by viewModel.crashEvent.collectAsState()
+    val context = androidx.compose.ui.platform.LocalContext.current
+
+    androidx.compose.runtime.LaunchedEffect(crashEvent) {
+        val event = crashEvent
+        if (event != null) {
+            val msg = event.second.ifBlank { context.getString(R.string.toast_crash_isolated) }
+            android.widget.Toast.makeText(context, msg, android.widget.Toast.LENGTH_LONG).show()
+            viewModel.clearCrashEvent()
+        }
+    }
 
     // Mostrar diálogo modal de progreso o error cuando el motor está instalando, iniciando o si falló
     when (val state = uiState) {

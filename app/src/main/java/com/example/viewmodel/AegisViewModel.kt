@@ -50,6 +50,12 @@ class AegisViewModel(application: Application) : AndroidViewModel(application) {
     private val _selectedPackageToClone = MutableStateFlow<String?>(null)
     val selectedPackageToClone: StateFlow<String?> = _selectedPackageToClone.asStateFlow()
 
+    val crashEvent: StateFlow<Pair<String, String>?> = com.aistudio.aegis.virtualcore.AegisReportProvider.crashEvents
+
+    fun clearCrashEvent() {
+        com.aistudio.aegis.virtualcore.AegisReportProvider.clearCrashEvent()
+    }
+
     init {
         observeEngineClones()
         refreshInstalledApps()

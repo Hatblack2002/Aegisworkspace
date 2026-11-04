@@ -43,6 +43,11 @@ object NativeGuestBridge {
     fun getLoadErrorReason(): String? = loadError
 
     /**
+     * Instala el Sandbox de Señales nativas (SIGSEGV, SIGABRT, etc.)
+     */
+    external fun nativeInstallCrashHandler()
+
+    /**
      * Configuración explícita del VFS cooperativo en C++
      */
     external fun nativeConfigureVfsMapping(

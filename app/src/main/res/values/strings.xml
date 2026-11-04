@@ -31,4 +31,6 @@
     <string name="cd_add_app">Añadir aplicación</string>
     <string name="cd_status_green">Semáforo verde: lectura exitosa</string>
     <string name="cd_status_red">Semáforo rojo: fallo de lectura</string>
+    <string name="toast_crash_isolated">La app se cerró inesperadamente</string>
+    <string name="error_stub_crashed">La app clonada se cerró inesperadamente en su proceso aislado. Aegis Engine sigue operativo.</string>
 </resources>

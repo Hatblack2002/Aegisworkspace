@@ -39,6 +39,13 @@ class AegisReportProvider : ContentProvider() {
                 return Bundle().apply { putBoolean("ack", true) }
             }
         }
+        if (method == METHOD_REPORT_CRASH && extras != null) {
+            val pkg = arg ?: "unknown"
+            val crashMsg = extras.getString(KEY_CRASH_MESSAGE, "La app se cerró inesperadamente")
+            Log.w(TAG, "Aviso de crash en sandbox recibido para $pkg: $crashMsg")
+            _crashEvents.value = Pair(pkg, crashMsg)
+            return Bundle().apply { putBoolean("ack", true) }
+        }
         return super.call(method, arg, extras)
     }
 
@@ -58,14 +65,23 @@ class AegisReportProvider : ContentProvider() {
     companion object {
         private const val TAG = "Aegis"
         const val METHOD_SUBMIT_REPORT = "submit_guest_maps_report"
+        const val METHOD_REPORT_CRASH = "report_guest_crash"
         const val KEY_REPORT_JSON = "report_json"
         const val KEY_PROCESS_NAME = "process_name"
+        const val KEY_CRASH_MESSAGE = "crash_message"
 
         private val _reportsByPackage = MutableStateFlow<Map<String, GuestMapsReport>>(emptyMap())
         val reportsByPackage: StateFlow<Map<String, GuestMapsReport>> = _reportsByPackage.asStateFlow()
 
         private val _latestEvent = MutableStateFlow<GuestMapsReport?>(null)
         val latestEvent: StateFlow<GuestMapsReport?> = _latestEvent.asStateFlow()
+
+        private val _crashEvents = MutableStateFlow<Pair<String, String>?>(null)
+        val crashEvents: StateFlow<Pair<String, String>?> = _crashEvents.asStateFlow()
+
+        fun clearCrashEvent() {
+            _crashEvents.value = null
+        }
 
         fun authority(context: Context): String = "${context.packageName}.aegis.report.provider"
 
@@ -102,6 +118,22 @@ class AegisReportProvider : ContentProvider() {
             } catch (e: Exception) {
                 Log.e(TAG, "Error enviando reporte por ContentProvider desde ${report.processName}: ${e.message}", e)
                 false
+            }
+        }
+
+        fun reportCrashToHost(context: Context, packageName: String, message: String) {
+            try {
+                val extras = Bundle().apply {
+                    putString(KEY_CRASH_MESSAGE, message)
+                }
+                context.contentResolver.call(
+                    uri(context),
+                    METHOD_REPORT_CRASH,
+                    packageName,
+                    extras
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "No se pudo avisar del crash al host: ${e.message}")
             }
         }
     }
