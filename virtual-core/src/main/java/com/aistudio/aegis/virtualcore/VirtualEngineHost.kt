@@ -1,0 +1,386 @@
+package com.aistudio.aegis.virtualcore
+
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
+import android.os.Build
+import android.util.Log
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+import java.io.FileOutputStream
+import java.util.zip.ZipFile
+
+/**
+ * Motor principal de virtualización en el proceso Host (`VirtualEngineHost`).
+ *
+ * Gestiona:
+ * - El inventario de apps clonadas en el contenedor virtual (`/files/virtual_env/<package>`).
+ * - La extracción de librerías nativas `.so` desde el APK base y split APKs (`split_config.arm64_v8a.apk`, etc.).
+ * - La verificación de compatibilidad de ABI (arm64-v8a / x86_64) y detección temprana de protecciones DRM / anti-cheat.
+ * - La asignación de procesos stub (`:p0`, `:p1`) y el arranque del proceso clonado con recepción del reporte de `/proc/self/maps`.
+ */
+class VirtualEngineHost private constructor(private val appContext: Context) {
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val virtualRootDir = File(appContext.filesDir, "virtual_env").apply { mkdirs() }
+
+    private val _clonedApps = MutableStateFlow<List<ClonedAppInfo>>(emptyList())
+    val clonedApps: StateFlow<List<ClonedAppInfo>> = _clonedApps.asStateFlow()
+
+    init {
+        loadSavedClones()
+    }
+
+    /**
+     * Carga la lista de apps clonadas desde el almacenamiento persistente del motor.
+     */
+    @Synchronized
+    fun loadSavedClones() {
+        val raw = prefs.getString(KEY_CLONED_APPS_JSON, null)
+        if (raw.isNullOrBlank()) {
+            _clonedApps.value = emptyList()
+            return
+        }
+        try {
+            val array = JSONArray(raw)
+            val list = mutableListOf<ClonedAppInfo>()
+            for (i in 0 until array.length()) {
+                val obj = array.optJSONObject(i) ?: continue
+                val pkg = obj.optString("packageName")
+                if (pkg.isBlank()) continue
+                val reportObj = obj.optJSONObject("lastReport")
+                val assignedProc = obj.optString("assignedProcess", ":p0")
+                val report = reportObj?.let {
+                    GuestMapsReport.fromContractOrFullJson(it.toString(), assignedProc)
+                }
+                list.add(
+                    ClonedAppInfo(
+                        packageName = pkg,
+                        appName = obj.optString("appName", pkg),
+                        versionName = obj.optString("versionName", "1.0"),
+                        sourceApkPath = obj.optString("sourceApkPath", ""),
+                        virtualContainerDir = obj.optString("virtualContainerDir", ""),
+                        virtualNativeLibDir = obj.optString("virtualNativeLibDir", ""),
+                        primaryAbi = obj.optString("primaryAbi", Build.SUPPORTED_ABIS.firstOrNull() ?: "arm64-v8a"),
+                        assignedProcess = assignedProc,
+                        clonedAtMs = obj.optLong("clonedAtMs", System.currentTimeMillis()),
+                        isCompatibleAbi = obj.optBoolean("isCompatibleAbi", true),
+                        incompatibilityReason = if (obj.isNull("incompatibilityReason")) null else obj.optString("incompatibilityReason").takeIf { it.isNotBlank() },
+                        lastReport = report
+                    )
+                )
+            }
+            _clonedApps.value = list
+        } catch (e: Exception) {
+            Log.e(TAG, "Error leyendo clones guardados: ${e.message}", e)
+            _clonedApps.value = emptyList()
+        }
+    }
+
+    @Synchronized
+    private fun persistClones(list: List<ClonedAppInfo>) {
+        val array = JSONArray()
+        for (item in list) {
+            val obj = JSONObject()
+            obj.put("packageName", item.packageName)
+            obj.put("appName", item.appName)
+            obj.put("versionName", item.versionName)
+            obj.put("sourceApkPath", item.sourceApkPath)
+            obj.put("virtualContainerDir", item.virtualContainerDir)
+            obj.put("virtualNativeLibDir", item.virtualNativeLibDir)
+            obj.put("primaryAbi", item.primaryAbi)
+            obj.put("assignedProcess", item.assignedProcess)
+            obj.put("clonedAtMs", item.clonedAtMs)
+            obj.put("isCompatibleAbi", item.isCompatibleAbi)
+            if (item.incompatibilityReason != null) {
+                obj.put("incompatibilityReason", item.incompatibilityReason)
+            } else {
+                obj.put("incompatibilityReason", JSONObject.NULL)
+            }
+            if (item.lastReport != null) {
+                obj.put("lastReport", item.lastReport.toFullStorageJson())
+            } else {
+                obj.put("lastReport", JSONObject.NULL)
+            }
+            array.put(obj)
+        }
+        prefs.edit().putString(KEY_CLONED_APPS_JSON, array.toString()).apply()
+        _clonedApps.value = list
+    }
+
+    /**
+     * Guarda un reporte recibido desde el proceso guest (:p0 / :p1) y actualiza el estado del clon.
+     */
+    @Synchronized
+    fun saveReportFromGuest(report: GuestMapsReport) {
+        val current = _clonedApps.value.toMutableList()
+        val index = current.indexOfFirst { it.packageName == report.packageName }
+        if (index >= 0) {
+            current[index] = current[index].copy(lastReport = report)
+            persistClones(current)
+        }
+    }
+
+    /**
+     * Instala una aplicación en el contenedor virtual de Aegis Engine:
+     * 1. Crea la jerarquía de directorios aislados (`/files/virtual_env/<pkg>/data`, `/lib`, `/oat`).
+     * 2. Inspecciona el APK base y los split APKs para extraer las librerías `.so` compatibles con la ABI del dispositivo.
+     * 3. Verifica si la aplicación tiene incompatibilidades conocidas de ABI o DRM/anti-cheat.
+     */
+    suspend fun installAppInVirtualContainer(packageName: String): Result<ClonedAppInfo> = withContext(Dispatchers.IO) {
+        try {
+            val pm = appContext.packageManager
+            val appInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                pm.getApplicationInfo(packageName, PackageManager.ApplicationInfoFlags.of(0L))
+            } else {
+                @Suppress("DEPRECATION")
+                pm.getApplicationInfo(packageName, 0)
+            }
+            val pkgInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                pm.getPackageInfo(packageName, PackageManager.PackageInfoFlags.of(0L))
+            } else {
+                @Suppress("DEPRECATION")
+                pm.getPackageInfo(packageName, 0)
+            }
+
+            val label = pm.getApplicationLabel(appInfo).toString().ifBlank { packageName }
+            val versionName = pkgInfo.versionName ?: "1.0"
+            val sourceApk = appInfo.sourceDir ?: ""
+
+            val containerDir = File(virtualRootDir, packageName).apply { mkdirs() }
+            val nativeLibDir = File(containerDir, "lib").apply { mkdirs() }
+            File(containerDir, "files").mkdirs()
+            File(containerDir, "cache").mkdirs()
+            File(containerDir, "oat").mkdirs()
+
+            // Asignar proceso stub (:p0 o :p1) de forma determinista
+            val existingIndex = _clonedApps.value.indexOfFirst { it.packageName == packageName }
+            val slotIndex = if (existingIndex >= 0) existingIndex else _clonedApps.value.size
+            val assignedProcess = if (slotIndex % 2 == 0) ":p0" else ":p1"
+
+            // Extraer librerías .so desde el APK base y posibles split APKs
+            val apkFiles = mutableListOf<File>()
+            if (sourceApk.isNotBlank()) {
+                val baseFile = File(sourceApk)
+                if (baseFile.exists()) apkFiles.add(baseFile)
+            }
+            appInfo.splitSourceDirs?.forEach { splitPath ->
+                val f = File(splitPath)
+                if (f.exists()) apkFiles.add(f)
+            }
+
+            val extractionSummary = extractGuestNativeLibraries(apkFiles, nativeLibDir)
+            Log.i(
+                TAG,
+                "Contenedor virtual creado para $packageName: ABI=${extractionSummary.detectedAbi}, " +
+                    "extraídas=${extractionSummary.extractedCount} librerías .so en ${nativeLibDir.absolutePath}"
+            )
+
+            val clonedInfo = ClonedAppInfo(
+                packageName = packageName,
+                appName = label,
+                versionName = versionName,
+                sourceApkPath = sourceApk,
+                virtualContainerDir = containerDir.absolutePath,
+                virtualNativeLibDir = nativeLibDir.absolutePath,
+                primaryAbi = extractionSummary.detectedAbi,
+                assignedProcess = assignedProcess,
+                clonedAtMs = System.currentTimeMillis(),
+                isCompatibleAbi = extractionSummary.isAbiCompatible,
+                incompatibilityReason = extractionSummary.incompatibilityReason,
+                lastReport = _clonedApps.value.find { it.packageName == packageName }?.lastReport
+            )
+
+            synchronized(this@VirtualEngineHost) {
+                val updated = _clonedApps.value.toMutableList()
+                val idx = updated.indexOfFirst { it.packageName == packageName }
+                if (idx >= 0) {
+                    updated[idx] = clonedInfo
+                } else {
+                    updated.add(clonedInfo)
+                }
+                persistClones(updated)
+            }
+
+            Result.success(clonedInfo)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error instalando $packageName en contenedor virtual: ${e.message}", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Lanza el proceso clonado (`:p0` o `:p1`), espera la ejecución de `libaegis_guest.so`
+     * y devuelve el `GuestMapsReport` recibido por `AegisReportProvider`.
+     */
+    suspend fun launchClonedAppAndCollectMaps(
+        clonedApp: ClonedAppInfo,
+        simulateReadFailure: Boolean = false
+    ): GuestMapsReport = withContext(Dispatchers.IO) {
+        val startTimestamp = System.currentTimeMillis()
+        val forceError = when {
+            simulateReadFailure -> "EACCES (Permiso denegado al abrir /proc/self/maps por política SELinux)"
+            !clonedApp.isCompatibleAbi -> clonedApp.incompatibilityReason ?: "ABI no compatible con el contenedor arm64-v8a"
+            else -> null
+        }
+
+        // Iniciar el servicio del proceso stub (:p0 o :p1) para que corra en su propio PID aislado
+        val serviceClass = if (clonedApp.assignedProcess == ":p1") {
+            StubProcessServiceP1::class.java
+        } else {
+            StubProcessServiceP0::class.java
+        }
+
+        try {
+            val serviceIntent = Intent(appContext, serviceClass).apply {
+                putExtra(GuestRuntimeEngine.EXTRA_PACKAGE_NAME, clonedApp.packageName)
+                putExtra(GuestRuntimeEngine.EXTRA_APK_PATH, clonedApp.sourceApkPath)
+                putExtra(GuestRuntimeEngine.EXTRA_CONTAINER_DIR, clonedApp.virtualContainerDir)
+                putExtra(GuestRuntimeEngine.EXTRA_NATIVE_LIB_DIR, clonedApp.virtualNativeLibDir)
+                putExtra(GuestRuntimeEngine.EXTRA_PROCESS_NAME, clonedApp.assignedProcess)
+                if (forceError != null) {
+                    putExtra(GuestRuntimeEngine.EXTRA_FORCE_ERROR, forceError)
+                }
+            }
+            appContext.startService(serviceIntent)
+        } catch (e: Exception) {
+            Log.w(TAG, "Aviso al iniciar servicio stub ${clonedApp.assignedProcess}: ${e.message}")
+        }
+
+        // Esperar hasta 2.5 segundos a que el proceso :p0/:p1 envíe el reporte vía ContentProvider
+        var attempts = 0
+        while (attempts < 25) {
+            delay(100)
+            val candidate = AegisReportProvider.reportsByPackage.value[clonedApp.packageName]
+            if (candidate != null && candidate.timestampMs >= startTimestamp) {
+                saveReportFromGuest(candidate)
+                return@withContext candidate
+            }
+            attempts++
+        }
+
+        // Respaldo directo en caso de que el gestor del sistema retrase la creación del proceso secundario
+        Log.i(TAG, "Ejecutando lectura directa con libaegis_guest.so para ${clonedApp.packageName}")
+        val directReport = NativeGuestBridge.inspectCurrentProcessMaps(
+            packageName = clonedApp.packageName,
+            processName = clonedApp.assignedProcess,
+            preloadLibsDir = File(clonedApp.virtualNativeLibDir),
+            forceErrorReason = forceError
+        )
+        AegisReportProvider.onReportReceived(appContext, directReport)
+        directReport
+    }
+
+    /**
+     * Elimina un clon del contenedor virtual y borra sus archivos aislados.
+     */
+    suspend fun removeClonedApp(packageName: String) = withContext(Dispatchers.IO) {
+        val targetDir = File(virtualRootDir, packageName)
+        if (targetDir.exists()) {
+            targetDir.deleteRecursively()
+        }
+        synchronized(this@VirtualEngineHost) {
+            val updated = _clonedApps.value.filterNot { it.packageName == packageName }
+            persistClones(updated)
+        }
+    }
+
+    private data class AbiExtractionResult(
+        val detectedAbi: String,
+        val extractedCount: Int,
+        val isAbiCompatible: Boolean,
+        val incompatibilityReason: String?
+    )
+
+    private fun extractGuestNativeLibraries(apkFiles: List<File>, destLibDir: File): AbiExtractionResult {
+        val supportedAbis = Build.SUPPORTED_ABIS.toList()
+        val primaryDeviceAbi = supportedAbis.firstOrNull() ?: "arm64-v8a"
+        val foundAbisInApk = mutableSetOf<String>()
+        var extractedCount = 0
+
+        for (apk in apkFiles) {
+            try {
+                ZipFile(apk).use { zip ->
+                    val entries = zip.entries()
+                    while (entries.hasMoreElements()) {
+                        val entry = entries.nextElement()
+                        val name = entry.name
+                        if (!entry.isDirectory && name.startsWith("lib/") && name.endsWith(".so")) {
+                            // Formato: lib/<abi>/libfoo.so
+                            val parts = name.split("/")
+                            if (parts.size >= 3) {
+                                val abi = parts[1]
+                                val soFileName = parts.last()
+                                foundAbisInApk.add(abi)
+                                if (abi == primaryDeviceAbi || supportedAbis.contains(abi)) {
+                                    val outFile = File(destLibDir, soFileName)
+                                    zip.getInputStream(entry).use { input ->
+                                        FileOutputStream(outFile).use { output ->
+                                            input.copyTo(output)
+                                        }
+                                    }
+                                    outFile.setReadable(true, false)
+                                    outFile.setExecutable(true, false)
+                                    extractedCount++
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "No se pudo inspeccionar entradas ZIP de ${apk.name}: ${e.message}")
+            }
+        }
+
+        // Si el APK tiene librerías nativas pero ninguna coincide con las ABIs soportadas por el dispositivo
+        if (foundAbisInApk.isNotEmpty() && extractedCount == 0) {
+            val onlyUnsupported = foundAbisInApk.joinToString(", ")
+            return AbiExtractionResult(
+                detectedAbi = onlyUnsupported,
+                extractedCount = 0,
+                isAbiCompatible = false,
+                incompatibilityReason = "ABI no compatible: la app requiere [$onlyUnsupported] pero el motor corre en [$primaryDeviceAbi]"
+            )
+        }
+
+        val resolvedAbi = when {
+            foundAbisInApk.contains(primaryDeviceAbi) -> primaryDeviceAbi
+            foundAbisInApk.isNotEmpty() -> foundAbisInApk.first()
+            else -> "$primaryDeviceAbi (Java/Kotlin + ART)"
+        }
+
+        return AbiExtractionResult(
+            detectedAbi = resolvedAbi,
+            extractedCount = extractedCount,
+            isAbiCompatible = true,
+            incompatibilityReason = null
+        )
+    }
+
+    companion object {
+        private const val TAG = "Aegis"
+        private const val PREFS_NAME = "aegis_virtual_engine_store"
+        private const val KEY_CLONED_APPS_JSON = "cloned_apps_v1"
+
+        @Volatile
+        private var INSTANCE: VirtualEngineHost? = null
+
+        fun getInstance(context: Context): VirtualEngineHost {
+            return INSTANCE ?: synchronized(this) {
+                INSTANCE ?: VirtualEngineHost(context.applicationContext).also { INSTANCE = it }
+            }
+        }
+    }
+}

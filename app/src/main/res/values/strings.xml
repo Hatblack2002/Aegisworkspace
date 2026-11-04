@@ -1,0 +1,34 @@
+<resources>
+    <string name="app_name">Aegis Engine</string>
+    <string name="header_tag">AEGIS ENGINE</string>
+    <string name="home_title">Mis apps clonadas</string>
+    <string name="home_subtitle">Ejecútalas en un espacio aislado</string>
+    <string name="home_empty_title">Aún no has clonado ninguna app</string>
+    <string name="home_empty_subtitle">Añade una app o juego instalado para ejecutarlo en el contenedor virtual e inspeccionar sus librerías .so en runtime.</string>
+    <string name="btn_add_app">Añadir app</string>
+    <string name="tile_add">Añadir</string>
+    <string name="add_screen_title">Añadir app</string>
+    <string name="search_placeholder">Buscar app o paquete…</string>
+    <string name="btn_clone_none">Selecciona una app</string>
+    <string name="btn_clone_one">Clonar 1 app</string>
+    <string name="menu_rerun">Reejecutar</string>
+    <string name="menu_view_result">Ver resultado</string>
+    <string name="menu_delete_clone">Eliminar clon</string>
+    <string name="status_green_title">VERDE</string>
+    <string name="status_green_subtitle">El motor leyó /proc/self/maps del proceso clonado</string>
+    <string name="status_red_title">ROJO</string>
+    <string name="status_red_subtitle">El motor no pudo leer /proc/self/maps</string>
+    <string name="btn_copy_json">Copiar JSON</string>
+    <string name="btn_rerun">Reejecutar</string>
+    <string name="btn_retry">Reintentar</string>
+    <string name="btn_copy_log">Copiar log</string>
+    <string name="card_details_title">Detalles</string>
+    <string name="card_log_title">Log</string>
+    <string name="progress_installing">Instalando en el contenedor…</string>
+    <string name="progress_starting">Iniciando proceso…</string>
+    <string name="progress_reading">Leyendo librerías…</string>
+    <string name="cd_back">Volver</string>
+    <string name="cd_add_app">Añadir aplicación</string>
+    <string name="cd_status_green">Semáforo verde: lectura exitosa</string>
+    <string name="cd_status_red">Semáforo rojo: fallo de lectura</string>
+</resources>

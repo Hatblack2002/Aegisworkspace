@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Outer Aegis Shield Silhouette -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,22L28,33v20c0,16.5 11.1,31.8 26,36c14.9,-4.2 26,-19.5 26,-36V33L54,22zM54,30.8l18,7.6v14.6c0,12.1 -7.8,23.5 -18,27.3c-10.2,-3.8 -18,-15.2 -18,-27.3V38.4L54,30.8z" />
+    <!-- Inner Isolated Container Cube / Core -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,39L41,46.5v15L54,69l13,-7.5v-15L54,39zM54,44.8l7.5,4.3L54,53.4l-7.5,-4.3L54,44.8zM46,52.8l6,3.5v7.2l-6,-3.5V52.8zM56,63.5v-7.2l6,-3.5v7.2L56,63.5z" />
+</vector>

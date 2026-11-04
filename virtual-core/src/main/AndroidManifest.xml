@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application>
+        <!-- Canal IPC Guest -> Host: ContentProvider en el proceso principal del host -->
+        <provider
+            android:name="com.aistudio.aegis.virtualcore.AegisReportProvider"
+            android:authorities="${applicationId}.aegis.report.provider"
+            android:exported="false" />
+
+        <!-- Procesos Stub (:p0, :p1, :p2) para aislar la ejecución del Guest -->
+        <activity
+            android:name="com.aistudio.aegis.virtualcore.StubProcessActivityP0"
+            android:exported="false"
+            android:process=":p0"
+            android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+
+        <activity
+            android:name="com.aistudio.aegis.virtualcore.StubProcessActivityP1"
+            android:exported="false"
+            android:process=":p1"
+            android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+
+        <service
+            android:name="com.aistudio.aegis.virtualcore.StubProcessServiceP0"
+            android:exported="false"
+            android:process=":p0" />
+
+        <service
+            android:name="com.aistudio.aegis.virtualcore.StubProcessServiceP1"
+            android:exported="false"
+            android:process=":p1" />
+    </application>
+
+</manifest>

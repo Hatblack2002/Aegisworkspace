@@ -1,0 +1,6 @@
+{
+  "name": "Aegis Engine",
+  "description": "Motor de virtualización de aplicaciones (app cloner) para Android 13 con inspección nativa de /proc/self/maps en tiempo real.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

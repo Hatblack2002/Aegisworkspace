@@ -1,0 +1,6 @@
+{
+  "summary": "Plan de implementación para Aegis Engine v1.0: motor de virtualización a nivel de aplicación (app cloner) para Android 13 con procesos stub aislados (:p0), librería nativa libaegis_guest.so compilada con CMake (alineación de 16 KB) para lectura de /proc/self/maps, canal IPC vía ContentProvider y UI en Jetpack Compose según la especificación de diseño.",
+  "updatedAt": "2026-11-04T16:48:01.320551088Z",
+  "requestFeedback": true,
+  "userFacing": true
+}
