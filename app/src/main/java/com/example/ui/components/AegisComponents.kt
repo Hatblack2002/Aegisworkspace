@@ -33,6 +33,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
@@ -402,6 +403,7 @@ fun ClonedAppTile(
     onRerunClick: () -> Unit,
     onViewResultClick: () -> Unit,
     onExploreFilesClick: () -> Unit,
+    onOpenReportClick: () -> Unit,
     onDeleteClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -497,6 +499,14 @@ fun ClonedAppTile(
                 }
             )
             DropdownMenuItem(
+                text = { Text(stringResource(R.string.menu_open_report)) },
+                leadingIcon = { Icon(Icons.Default.Description, contentDescription = null) },
+                onClick = {
+                    showMenu = false
+                    onOpenReportClick()
+                }
+            )
+            DropdownMenuItem(
                 text = {
                     Text(
                         text = stringResource(R.string.menu_delete_clone),
@@ -580,6 +590,7 @@ fun ClonedAppGrid(
     onRerunApp: (ClonedAppUiItem) -> Unit,
     onViewResult: (ClonedAppUiItem) -> Unit,
     onExploreFiles: (ClonedAppUiItem) -> Unit,
+    onOpenReport: (ClonedAppUiItem) -> Unit,
     onDeleteApp: (ClonedAppUiItem) -> Unit,
     onAddAppClick: () -> Unit,
     modifier: Modifier = Modifier
@@ -609,6 +620,7 @@ fun ClonedAppGrid(
                                     onRerunClick = { onRerunApp(app) },
                                     onViewResultClick = { onViewResult(app) },
                                     onExploreFilesClick = { onExploreFiles(app) },
+                                    onOpenReportClick = { onOpenReport(app) },
                                     onDeleteClick = { onDeleteApp(app) }
                                 )
                             }

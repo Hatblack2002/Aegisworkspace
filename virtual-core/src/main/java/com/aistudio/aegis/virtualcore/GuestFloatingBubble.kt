@@ -1,6 +1,7 @@
 package com.aistudio.aegis.virtualcore
 
 import android.app.Activity
+import android.content.Intent
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Typeface
@@ -168,6 +169,7 @@ object GuestFloatingBubble {
                 setPadding(0, (4 * resources.displayMetrics.density).toInt(), 0, (8 * resources.displayMetrics.density).toInt())
             }
             val btnRead = styledButton("Intentar leer librerías", 0xFF2563EB.toInt())
+            val btnReport = styledButton("Ver informe de fallos", 0xFF0F766E.toInt())
             val btnClose = styledButton("Cerrar contenedor", 0xFFB3261E.toInt())
 
             btnRead.setOnClickListener {
@@ -197,6 +199,19 @@ object GuestFloatingBubble {
                 }.start()
             }
 
+            btnReport.setOnClickListener {
+                // Abre la actividad de informes en el PROCESO PRINCIPAL del host
+                // (sobrevive a la muerte del proceso guest; lee los archivos del historial).
+                val hostPkg = GuestSession.hostPackage.ifBlank { activity.packageName }
+                val reportIntent = Intent().apply {
+                    setClassName(hostPkg, GuestRuntimeEngine.HOST_REPORT_ACTIVITY)
+                    putExtra(GuestRuntimeEngine.EXTRA_REPORT_PACKAGE, packageName)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                runCatching { activity.startActivity(reportIntent) }
+                    .onFailure { Log.w(TAG, "no se pudo abrir el informe: ${it.message}") }
+            }
+
             btnClose.setOnClickListener {
                 try { activity.finish() } catch (_: Throwable) {}
                 Process.killProcess(Process.myPid())
@@ -205,6 +220,8 @@ object GuestFloatingBubble {
             addView(title)
             addView(status)
             addView(btnRead, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+            addView(btnReport, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
             addView(btnClose, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
@@ -218,6 +235,8 @@ object GuestFloatingBubble {
             AegisReportProvider.reportsByPackage.value[packageName]
         } catch (_: Throwable) { null }
         return when {
+            GuestLaunchTracker.watchdogFired ->
+                "PANTALLA EN BLANCO detectada (sin ventana en ${GuestLaunchTracker.WATCHDOG_SECONDS}s) — informe generado, botón abajo"
             report == null -> "Sin lectura todavía — corre la app y usa el botón de abajo"
             report.ok -> "Última lectura OK: ${report.libs.size} librerías (PID ${report.pid})"
             else -> "Última lectura FALLÓ: ${report.error ?: "motivo desconocido"}"

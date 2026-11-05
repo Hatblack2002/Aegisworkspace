@@ -63,6 +63,7 @@ fun HomeScreen(
     onRerunClone: (ClonedAppUiItem) -> Unit,
     onViewCloneResult: (ClonedAppUiItem) -> Unit,
     onExploreFiles: (ClonedAppUiItem) -> Unit,
+    onOpenReport: (ClonedAppUiItem) -> Unit,
     onDeleteClone: (ClonedAppUiItem) -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -119,6 +120,7 @@ fun HomeScreen(
                                 onRerunApp = onRerunClone,
                                 onViewResult = onViewCloneResult,
                                 onExploreFiles = onExploreFiles,
+                                onOpenReport = onOpenReport,
                                 onDeleteApp = onDeleteClone,
                                 onAddAppClick = onAddAppClick
                             )
@@ -130,7 +132,7 @@ fun HomeScreen(
 
                 if (clonedApps.isNotEmpty()) {
                     Text(
-                        text = "Toque: ejecutar la app ya · Mantén pulsado: diagnosticar librerías y más opciones",
+                        text = "Toque: ejecutar la app · Mantén pulsado: diagnóstico, informe de fallos y más opciones",
                         style = MaterialTheme.typography.labelMedium,
                         color = AegisOnSurfaceVariant,
                         textAlign = TextAlign.Center,

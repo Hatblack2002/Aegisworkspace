@@ -30,6 +30,8 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.lang.reflect.Method
+import java.util.Locale
+import java.util.zip.ZipFile
 
 /**
  * Cargador y entorno de ejecución cooperativo para el proceso clonado (:p0, :p1).
@@ -59,6 +61,10 @@ object GuestRuntimeEngine {
     const val EXTRA_LAUNCH_UI = "extra_guest_launch_ui"
     const val EXTRA_FORCE_ERROR = "extra_guest_force_error"
     const val EXTRA_GUEST_CLASS = "extra_guest_class"
+
+    /** Actividad del proceso principal que muestra los informes de fallo (app module). */
+    const val HOST_REPORT_ACTIVITY = "com.example.ReportActivity"
+    const val EXTRA_REPORT_PACKAGE = "extra_report_package"
 
     /**
      * Contexto virtual del invitado (ParallelSpace-style). El invitado ve:
@@ -197,9 +203,11 @@ object GuestRuntimeEngine {
     /** Stub (por launchMode y slot de proceso) para un componente del invitado. */
     internal fun stubActivityNameFor(guestClassName: String): String = runCatching {
         val pkg = GuestSession.packageName
-        val info = if (guestClassName.isNotBlank()) {
+        // Alias: el launchMode que aplica el AMS es el del activity REAL (targetActivity).
+        val realClass = GuestActivityTransmuter.resolveAliasClass(pkg, guestClassName)
+        val info = if (realClass.isNotBlank()) {
             GuestRuntimeEngine.hostContextForStubs?.packageManager
-                ?.getActivityInfo(android.content.ComponentName(pkg, guestClassName), 0)
+                ?.getActivityInfo(android.content.ComponentName(pkg, realClass), 0)
         } else null
         val suffix = if (GuestSession.stubProcessSuffix == ":p1") "P1" else "P0"
         when (info?.launchMode ?: ActivityInfo.LAUNCH_MULTIPLE) {
@@ -323,6 +331,69 @@ object GuestRuntimeEngine {
         return resolveAllApkFiles(context, packageName, fallbackApkPath)
     }
 
+    data class ApkVerifySummary(val allOk: Boolean, val summary: String)
+
+    /**
+     * Verificación RÁPIDA (hilo principal, sin hashing) de las copias del sandbox:
+     * existencia, zip legible y entradas classes*.dex (base.apk debe tener código;
+     * los splits de recursos/ABI no). Copia corrupta -> re-copia desde el original.
+     * El SHA-256 completo corre aparte (GuestLaunchTracker.computeApkInventoryAsync).
+     */
+    fun quickVerifyAndRepairRuntimeApks(
+        context: Context,
+        packageName: String,
+        sandboxApks: List<File>
+    ): ApkVerifySummary {
+        if (sandboxApks.isEmpty()) {
+            return ApkVerifySummary(false, "sin APKs en virtual_env/$packageName/apk — toca la app en Aegis para re-clonar")
+        }
+        val lines = mutableListOf<String>()
+        val broken = mutableListOf<String>()
+        for (apk in sandboxApks) {
+            var okFile = apk.exists() && apk.length() > 0
+            var dexCount = -1
+            if (okFile) {
+                runCatching {
+                    ZipFile(apk).use { zip ->
+                        dexCount = zip.entries().asSequence()
+                            .count { it.name.matches(Regex("classes[0-9]*\\.dex")) }
+                    }
+                }.onFailure { okFile = false }
+            }
+            val needsCode = apk.name == "base.apk"
+            val fileOk = okFile && (!needsCode || dexCount > 0)
+            if (apk.canWrite()) apk.setReadOnly()   // regla: solo lectura antes de cargar
+            if (fileOk) {
+                lines.add("${apk.name}: %.1f MB".format(Locale.US, apk.length() / 1048576.0) + " · $dexCount dex")
+            } else {
+                broken.add(apk.name)
+            }
+        }
+        if (broken.isNotEmpty()) {
+            AegisLog.w("copias corruptas (${broken.size}): $broken — re-copiando desde el original")
+            val sources = resolveAllApkFiles(context, packageName, "")
+            return if (sources.isNotEmpty()) {
+                val repaired = rebuildSandboxApkCopies(context, packageName, sources)
+                ApkVerifySummary(true, "RE-COPIADO desde el original (${repaired.size} APKs; copias previas corruptas: $broken)")
+            } else {
+                ApkVerifySummary(false, "copias corruptas ($broken) y el original no es legible — toca la app en Aegis para re-clonar")
+            }
+        }
+        return ApkVerifySummary(true, lines.joinToString(" · "))
+    }
+
+    /** Reemplaza TODAS las copias del sandbox con re-copias frescas del original. */
+    fun rebuildSandboxApkCopies(context: Context, packageName: String, sourceApks: List<File>): List<File> {
+        val dir = File(context.filesDir, "virtual_env/$packageName/apk").apply { mkdirs() }
+        dir.listFiles()?.forEach { runCatching { it.delete() } }
+        return sourceApks.mapIndexed { index, src ->
+            val dest = File(dir, if (index == 0) "base.apk" else "split_config_$index.apk")
+            src.copyTo(dest, overwrite = true)
+            dest.setReadOnly()
+            dest
+        }
+    }
+
     // ---- ClassLoader compartido por proceso ----------------------------------
 
     private val loadersByPackage = HashMap<String, DexClassLoader>()
@@ -377,16 +448,44 @@ object GuestRuntimeEngine {
             val appClassName = try {
                 mainThreadContext.packageManager.getApplicationInfo(packageName, 0).className
             } catch (_: Exception) { null }
-            val clazz: Class<*> = if (!appClassName.isNullOrBlank() && runCatching {
-                    Application::class.java.isAssignableFrom(guestLoader.loadClass(appClassName))
-                }.getOrDefault(false)
-            ) {
-                guestLoader.loadClass(appClassName)
+
+            // Paso HONESTO "Carga de Application": OK solo si loadClass de la clase
+            // declarada tuvo éxito (y es un Application). Nunca fingir un OK genérico.
+            var declaredClass: Class<*>? = null
+            if (!appClassName.isNullOrBlank()) {
+                try {
+                    val loaded = guestLoader.loadClass(appClassName)
+                    if (Application::class.java.isAssignableFrom(loaded)) {
+                        declaredClass = loaded
+                        GuestLaunchTracker.loaderHashForApplication = System.identityHashCode(guestLoader).toLong()
+                        GuestLaunchTracker.ok(
+                            "Carga de Application",
+                            "${loaded.name} (loader=0x${Integer.toHexString(System.identityHashCode(guestLoader))})"
+                        )
+                    } else {
+                        GuestLaunchTracker.exception(
+                            ClassCastException("${loaded.name} no extiende android.app.Application"),
+                            "Carga de Application: la clase declarada $appClassName cargó pero no es un Application"
+                        )
+                        GuestLaunchTracker.fail("Carga de Application", "$appClassName cargó pero NO extiende android.app.Application")
+                    }
+                } catch (t: Throwable) {
+                    GuestLaunchTracker.exception(
+                        t,
+                        "Carga de Application: buscaba la clase declarada $appClassName en el dexPath del invitado"
+                    )
+                    GuestLaunchTracker.fail("Carga de Application", GuestLaunchTracker.describeThrowable(t))
+                }
             } else {
-                // Sin Application declarado: instancia genérica del loader del invitado
-                // para que getApplication() nunca devuelva el Application de Aegis.
-                Application::class.java
+                GuestLaunchTracker.unverified(
+                    "Carga de Application",
+                    "el manifest del invitado no declara android:name — se usa Application genérica"
+                )
             }
+            val clazz: Class<*> = declaredClass
+                // Sin Application declarado (o no cargable): instancia genérica del loader
+                // del invitado para que getApplication() nunca devuelva el de Aegis.
+                ?: Application::class.java
             val guestApp = clazz.getDeclaredConstructor().newInstance() as Application
 
             // Publicar ANTES de construir el contexto de attach: así getApplicationContext()
@@ -398,7 +497,13 @@ object GuestRuntimeEngine {
             attachMethod.invoke(guestApp, attachContext)
             try {
                 guestApp.onCreate()
+                GuestLaunchTracker.ok("Application.onCreate", clazz.name)
             } catch (t: Throwable) {
+                GuestLaunchTracker.exception(
+                    t,
+                    "Application.onCreate de ${clazz.name}: el SDK del invitado lanzó una excepción durante su inicialización"
+                )
+                GuestLaunchTracker.fail("Application.onCreate", GuestLaunchTracker.describeThrowable(t))
                 GuestSession.lastError = "guest Application.onCreate: ${t.message}"
                 Log.w(TAG, "guest Application.onCreate falló (no fatal): ${t.message}")
             }
@@ -406,6 +511,11 @@ object GuestRuntimeEngine {
             Log.i(TAG, "Application del invitado alojado en hilo principal: ${clazz.name}")
             guestApp
         } catch (t: Throwable) {
+            GuestLaunchTracker.exception(
+                t,
+                "hostGuestApplication($packageName): no se pudo adjuntar el Application del invitado"
+            )
+            GuestLaunchTracker.fail("Carga de Application", GuestLaunchTracker.describeThrowable(t))
             GuestSession.lastError = "hostGuestApplication($packageName): ${t.message}"
             Log.w(TAG, "No se pudo alojar el Application de $packageName (no fatal): ${t.message}")
             null
@@ -420,8 +530,22 @@ object GuestRuntimeEngine {
             val info = try {
                 activity.packageManager.getActivityInfo(android.content.ComponentName(pkg, guestClassName), 0)
             } catch (_: Exception) { null }
+
+            // CRÍTICO (CNFE en VLC/YouTube): el launcher puede ser un activity-alias.
+            // El extra debe llevar la CLASE REAL (targetActivity), no el nombre del alias.
+            var realClass = guestClassName
+            if (!info?.targetActivity.isNullOrBlank()) {
+                realClass = info!!.targetActivity!!
+                AegisLog.i("lanzamiento: alias $guestClassName -> clase real $realClass")
+            }
+            val modeInfo = if (realClass != guestClassName) {
+                try {
+                    activity.packageManager.getActivityInfo(android.content.ComponentName(pkg, realClass), 0)
+                } catch (_: Exception) { info }
+            } else info
+
             val suffix = if (GuestSession.stubProcessSuffix == ":p1") "P1" else "P0"
-            val stubClass = when (info?.launchMode ?: ActivityInfo.LAUNCH_MULTIPLE) {
+            val stubClass = when (modeInfo?.launchMode ?: ActivityInfo.LAUNCH_MULTIPLE) {
                 ActivityInfo.LAUNCH_SINGLE_TOP -> StubProcessActivityP0SingleTop::class.java
                 ActivityInfo.LAUNCH_SINGLE_TASK -> StubProcessActivityP0SingleTask::class.java
                 ActivityInfo.LAUNCH_SINGLE_INSTANCE -> StubProcessActivityP0SingleInstance::class.java
@@ -438,15 +562,18 @@ object GuestRuntimeEngine {
             }
             val launchIntent = Intent(activity, stubClass).apply {
                 putExtra(EXTRA_PACKAGE_NAME, pkg)
-                putExtra(EXTRA_GUEST_CLASS, guestClassName)
+                putExtra(EXTRA_GUEST_CLASS, realClass)
                 putExtra(EXTRA_LAUNCH_UI, true)
             }
             activity.startActivity(launchIntent)
-            Log.i(TAG, "lanzamiento del invitado por stub=${stubClass.simpleName}: $guestClassName")
+            GuestLaunchTracker.ok("Lanzamiento del proxy", "${stubClass.simpleName} en lugar de $realClass")
+            Log.i(TAG, "lanzamiento del invitado por stub=${stubClass.simpleName}: $realClass")
             true
         } catch (t: Throwable) {
-            // Motivo EXACTO del fallo: se muestra en la pantalla de diagnóstico del stub
-            // (GuestSession.lastError -> "Error: ..."), no solo en logcat.
+            // Motivo EXACTO del fallo: en el informe y en la pantalla de diagnóstico.
+            val chain = GuestLaunchTracker.describeThrowable(t)
+            GuestLaunchTracker.exception(t, "Lanzamiento del proxy: startActivity no pudo lanzar el stub para $guestClassName")
+            GuestLaunchTracker.fail("Lanzamiento del proxy", chain)
             GuestSession.lastError =
                 "startActivity($guestClassName): ${t.javaClass.simpleName}: ${t.message ?: "sin mensaje"}"
             Log.w(TAG, "lanzamiento del invitado falló: ${t.message}")
@@ -591,6 +718,9 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
 
     companion object {
         private const val TAG = "AegisStubActivity"
+
+        /** Referencia al handler propio para no delegar en él (recursión infinita). */
+        @Volatile private var ownCrashHandler: Thread.UncaughtExceptionHandler? = null
     }
 
     private var isTerminatingCleanly = false
@@ -612,6 +742,13 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
         val containerDirPath = intentData.getStringExtra(GuestRuntimeEngine.EXTRA_CONTAINER_DIR) ?: ""
         val nativeLibDirPath = intentData.getStringExtra(GuestRuntimeEngine.EXTRA_NATIVE_LIB_DIR) ?: ""
         val launchUi = intentData.getBooleanExtra(GuestRuntimeEngine.EXTRA_LAUNCH_UI, true)
+
+        // Rastreo HONESTO del intento (engine v2.3). Solo el bootstrap inicia el intento:
+        // el stub proxy (EXTRA_GUEST_CLASS presente) pertenece al intento ya en curso.
+        val isBootstrapLaunch = intentData.getStringExtra(GuestRuntimeEngine.EXTRA_GUEST_CLASS).isNullOrBlank()
+        if (isBootstrapLaunch) {
+            GuestLaunchTracker.reset(packageName)
+        }
 
         // Crash handler nativo (SIGSEGV, SIGABRT) del invitado
         try {
@@ -644,11 +781,42 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
             HiddenApiExempt.exemptAll()
 
             val allApkFiles = GuestRuntimeEngine.resolveRuntimeApkFiles(this, packageName, apkPath)
+            // Paso "Copia de APK al sandbox": verificación rápida + reparación de copias
+            // corruptas. El SHA-256 frente al original corre en segundo plano (informe).
+            if (isBootstrapLaunch) {
+                val verify = GuestRuntimeEngine.quickVerifyAndRepairRuntimeApks(this, packageName, allApkFiles)
+                if (verify.allOk) {
+                    GuestLaunchTracker.ok("Copia de APK al sandbox", verify.summary)
+                } else {
+                    GuestLaunchTracker.fail("Copia de APK al sandbox", verify.summary)
+                }
+                GuestLaunchTracker.computeApkInventoryAsync(
+                    applicationContext, allApkFiles,
+                    GuestRuntimeEngine.resolveAllApkFiles(this, packageName, apkPath)
+                )
+            }
             diagnostics += "APKs huésped: ${allApkFiles.size} (${if (allApkFiles.firstOrNull()?.parentFile?.name == "apk") "copias sandbox" else "rutas del sistema"})"
             val guestLoader = GuestRuntimeEngine.loaderFor(this, packageName, allApkFiles, containerDir, nativeLibDir)
             if (guestLoader == null) {
                 diagnostics += "Classloader: FALLO (DexClassLoader no creado)"
+                if (isBootstrapLaunch) {
+                    GuestLaunchTracker.fail(
+                        "Creación del ClassLoader",
+                        "DexClassLoader no creado — revisa el inventario de APKs; sin classloader no hay código del invitado"
+                    )
+                }
             } else {
+                if (isBootstrapLaunch) {
+                    GuestLaunchTracker.recordClassLoader(
+                        allApkFiles.joinToString(File.pathSeparator) { it.absolutePath },
+                        nativeLibDir.absolutePath,
+                        System.identityHashCode(guestLoader).toLong()
+                    )
+                    GuestLaunchTracker.ok(
+                        "Creación del ClassLoader",
+                        "${allApkFiles.size} APKs en el dexPath; loader=0x${Integer.toHexString(System.identityHashCode(guestLoader))}"
+                    )
+                }
                 diagnostics += "Classloader: OK"
                 val guestRes = GuestRuntimeEngine.createGuestResources(this, allApkFiles)
                 if (guestRes == null) diagnostics += "Recursos invitado: FALLO (AssetManager)"
@@ -678,16 +846,31 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
                 val guestApp = GuestRuntimeEngine.hostGuestApplication(
                     applicationContext, packageName, guestLoader
                 )
+                // Línea HONESTA: el estado real viene de los pasos del tracker, no de
+                // "el objeto se creó". GENÉRICA/"no cargó" no es un OK.
                 diagnostics += "Application invitado: " + when {
-                    guestApp == null -> "FALLO"
+                    guestApp == null -> "FALLO (ver informe)"
                     guestApp.javaClass == android.app.Application::class.java ->
-                        "GENÉRICO (la clase declarada no cargó — revisa la sonda dex del clon)"
-                    else -> "OK (${guestApp.javaClass.name})"
+                        "GENÉRICA — la clase declarada no cargó (ver informe)"
+                    else -> {
+                        val onCreateStep = GuestLaunchTracker.snapshotSteps().lastOrNull { it.label == "Application.onCreate" }
+                        "cargada (${guestApp.javaClass.name}) · onCreate " + when (onCreateStep?.status) {
+                            GuestLaunchTracker.Status.OK -> "OK"
+                            GuestLaunchTracker.Status.FAIL -> "FALLÓ (ver informe)"
+                            else -> "no verificado"
+                        }
+                    }
                 }
 
                 // Hooks de transmutación: los stubs pasan a ser actividades reales del invitado.
                 val hooksOk = ActivityThreadHook.installIfNeeded()
                 diagnostics += "Instrumentation: ${if (hooksOk) "instalada" else "NO DISPONIBLE (API oculta bloqueada)"}"
+                if (!hooksOk && isBootstrapLaunch) {
+                    GuestLaunchTracker.unverified(
+                        "Instrumentation",
+                        "no se pudo instalar (API oculta bloqueada): sin ella no hay transmutación stub→invitado"
+                    )
+                }
                 Log.i(TAG, "Instrumentation transmutadora ${if (hooksOk) "instalada" else "NO disponible"} en $stubSuffix")
 
                 if (launchUi && hooksOk) {
@@ -699,12 +882,42 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
                         // la clase real del invitado). Se muestra el motivo exacto y NO se
                         // re-lanza: re-lanzar aquí produciría una recursión infinita de stubs.
                         diagnostics += "Transmutación de instancia: FALLO (stub creado en vez de $proxyTarget)"
+                        if (GuestSession.lastError.isBlank()) {
+                            diagnostics += "newActivity no registró excepción — la transmutación no llegó a intentarse"
+                        }
+                        GuestLaunchTracker.persistReport(
+                            applicationContext, packageName,
+                            "TRANSMUTACIÓN FALLIDA (stub en vez de $proxyTarget)"
+                        )
                     } else {
                         val guestClassName = findLaunchActivityClassName(packageName)
                         if (guestClassName.isNullOrBlank()) {
                             diagnostics += "Lanzador del invitado: NO ENCONTRADO"
+                            if (isBootstrapLaunch) {
+                                GuestLaunchTracker.unverified(
+                                    "Actividad launcher",
+                                    "no encontrada (getLaunchIntentForPackage vacío — revisa visibilidad de paquetes)"
+                                )
+                            }
                         } else {
-                            diagnostics += "Lanzador: $guestClassName"
+                            // Alias → clase real (VLC/YouTube declaran el launcher como alias).
+                            val realLauncher = GuestActivityTransmuter.resolveAliasClass(packageName, guestClassName)
+                            diagnostics += if (realLauncher != guestClassName) "Lanzador: $guestClassName (alias → $realLauncher)"
+                                          else "Lanzador: $guestClassName"
+                            if (isBootstrapLaunch) {
+                                // Sonda HONESTA de la clase launcher antes de lanzar: OK solo si
+                                // loadClass tuvo éxito con el classloader del invitado.
+                                try {
+                                    guestLoader.loadClass(realLauncher)
+                                    GuestLaunchTracker.ok("Actividad launcher", "$realLauncher cargable con el classloader del invitado")
+                                } catch (t: Throwable) {
+                                    GuestLaunchTracker.exception(
+                                        t,
+                                        "Actividad launcher: buscaba la clase $realLauncher en el dexPath del invitado"
+                                    )
+                                    GuestLaunchTracker.fail("Actividad launcher", GuestLaunchTracker.describeThrowable(t))
+                                }
+                            }
                             if (GuestRuntimeEngine.launchGuestActivityFrom(this, guestClassName)) {
                                 transmutationReady = true
                             } else {
@@ -731,6 +944,11 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
             if (GuestSession.lastError.isNotBlank()) {
                 diagnostics += "Error: ${GuestSession.lastError}"
             }
+            diagnostics += "→ 'Ver informe completo' tiene la causa real con todos los Caused by"
+            GuestLaunchTracker.persistReport(
+                applicationContext, packageName,
+                "ARRANQUE FALLIDO (pantalla de diagnóstico del motor)"
+            )
             showFullscreenProcessWorkspace(rootContainer, packageName, diagnostics)
         }
 
@@ -749,41 +967,50 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
     }
 
     /**
-     * Captura y aísla fallos de ejecución de la app clonada: notifica al host,
-     * finaliza esta Activity y termina SOLO el proceso stub (:p0/:p1). Aegis nunca se cierra.
+     * Captura y aísla fallos de ejecución de la app clonada.
+     * v2.3: guarda el STACK COMPLETO en un archivo del host ANTES de que el proceso
+     * muera (el toast del sistema lo corta; el archivo no), avisa al host y DELEGA al
+     * handler original (ART termina el proceso como siempre haría).
      */
     private fun installStubCrashSandbox() {
-        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
-            val pkg = intent?.getStringExtra(GuestRuntimeEngine.EXTRA_PACKAGE_NAME) ?: "App clonada"
-            // Resumen honesto del fallo: clase exacta + primer "Caused by" de la cadena,
-            // para diagnosticar sin logcat (mismo dato que filtrar por AndroidRuntime).
-            val firstCause = runCatching { Log.getStackTraceString(throwable) }.getOrNull()
-                ?.lineSequence()
-                ?.map { it.trimStart() }
-                ?.firstOrNull { it.startsWith("Caused by:") }
-            val errorMsg = buildString {
-                append("La app se cerró inesperadamente (")
-                append(throwable.javaClass.name)
-                append(": ")
-                append(throwable.message ?: "sin mensaje")
-                append(")")
-                firstCause?.let { append(" · "); append(it.take(200)) }
+        val existing = Thread.getDefaultUncaughtExceptionHandler()
+        if (existing != null && existing === ownCrashHandler) return  // ya instalado en este proceso
+        val previousHandler = existing
+        val appContext = applicationContext
+        val pkgAtInstall = intent?.getStringExtra(GuestRuntimeEngine.EXTRA_PACKAGE_NAME).orEmpty()
+        val handler = Thread.UncaughtExceptionHandler { thread, throwable ->
+            val pkg = pkgAtInstall.ifBlank { GuestLaunchTracker.guestPackage.ifBlank { "App clonada" } }
+
+            // 1. Informe completo (excepción con todos los Caused by + timeline + inventario)
+            //    a archivo del host, ANTES de que el proceso muera.
+            runCatching {
+                GuestLaunchTracker.recordCrash(throwable)
+                GuestLaunchTracker.persistReport(
+                    appContext, pkg,
+                    "CRASH (excepción no capturada: ${throwable.javaClass.name}: ${throwable.message ?: "sin mensaje"})"
+                )
+            }.onFailure { Log.w(TAG, "no se pudo guardar el informe de crash: ${it.message}") }
+
+            // 2. Aviso rápido al host (toast del proceso principal)
+            runCatching {
+                AegisReportProvider.reportCrashToHost(
+                    appContext, pkg,
+                    "La app se cerró (${throwable.javaClass.name}: ${throwable.message ?: "sin mensaje"}) " +
+                        "— informe completo en Aegis → menú del clon → 'Informe de fallos'"
+                )
             }
-            GuestSession.lastError = errorMsg
-            Log.e(TAG, "Aegis Crash Sandbox capturó fallo en proceso $stubSuffix: $errorMsg", throwable)
 
-            // 1. Notificar al host mediante ContentProvider
-            try {
-                AegisReportProvider.reportCrashToHost(applicationContext, pkg, errorMsg)
-            } catch (_: Exception) {}
-
-            // 2. Finalizar la pantalla y terminar sólo este proceso stub
-            try {
-                finish()
-            } catch (_: Exception) {}
-
-            Process.killProcess(Process.myPid())
+            // 3. Delegar al handler original: ART termina el proceso como siempre haría.
+            val previous = previousHandler
+            if (previous != null) {
+                runCatching { previous.uncaughtException(thread, throwable) }
+                    .onFailure { Process.killProcess(Process.myPid()) }
+            } else {
+                Process.killProcess(Process.myPid())
+            }
         }
+        ownCrashHandler = handler
+        Thread.setDefaultUncaughtExceptionHandler(handler)
     }
 
     private fun findLaunchActivityClassName(packageName: String): String? {
@@ -864,8 +1091,32 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
             }
         }
 
+        // Informe de fallos completo (timeline, excepciones, APKs, classloader, logs).
+        val btnReport = Button(this).apply {
+            text = "Ver informe completo"
+            setBackgroundColor(0xFF0F766E.toInt())
+            setTextColor(0xFFFFFFFF.toInt())
+            setOnClickListener {
+                val hostPkg = GuestSession.hostPackage.ifBlank { packageName }
+                val reportIntent = Intent().apply {
+                    setClassName(hostPkg, GuestRuntimeEngine.HOST_REPORT_ACTIVITY)
+                    putExtra(GuestRuntimeEngine.EXTRA_REPORT_PACKAGE, packageName)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                runCatching { startActivity(reportIntent) }
+                    .onFailure { Log.w(TAG, "no se pudo abrir el informe: ${it.message}") }
+            }
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+            }
+        }
+
         centerBox.addView(titleView)
         centerBox.addView(subView)
+        centerBox.addView(btnReport)
         centerBox.addView(btnClose)
 
         layout.addView(centerBox)

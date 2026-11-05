@@ -32,14 +32,38 @@ import java.lang.reflect.Field
 object GuestActivityTransmuter {
     private const val TAG = "AegisTransmuter"
 
+    private val aliasCache = HashMap<String, String>()
+
+    /**
+     * activity-alias -> clase REAL (ActivityInfo.targetActivity). VLC (".StartActivity")
+     * y YouTube (".Shell$HomeActivity") declaran su launcher como ALIAS: loadClass del
+     * alias da ClassNotFoundException POR DISEÑO (el alias no es una clase). Se resuelve
+     * siempre a la clase real antes de instanciar. Con caché por proceso.
+     */
+    internal fun resolveAliasClass(guestPackage: String, className: String): String {
+        if (guestPackage.isBlank()) return className
+        synchronized(aliasCache) { aliasCache["$guestPackage|$className"]?.let { return it } }
+        val resolved = runCatching {
+            val ctx = GuestRuntimeEngine.hostContextForStubs ?: ActivityThreadHook.currentApplication()
+            val info = ctx?.packageManager?.getActivityInfo(ComponentName(guestPackage, className), 0)
+            val target = info?.targetActivity
+            if (!target.isNullOrBlank()) {
+                AegisLog.i("activity-alias resuelto: $className -> $target")
+                target
+            } else className
+        }.getOrDefault(className)
+        synchronized(aliasCache) { aliasCache["$guestPackage|$className"] = resolved }
+        return resolved
+    }
+
     /** Decide qué clase invitada representa un lanzamiento (extra o namespace del invitado). */
     fun transmutableGuestClass(intent: Intent?, stubClassName: String?): String? {
         val fromExtra = intent?.getStringExtra(GuestRuntimeEngine.EXTRA_GUEST_CLASS)
-        if (!fromExtra.isNullOrBlank()) return fromExtra
+        if (!fromExtra.isNullOrBlank()) return resolveAliasClass(GuestSession.packageName, fromExtra)
         val pkg = GuestSession.packageName
         if (pkg.isBlank()) return null
         val candidate = intent?.component?.className ?: stubClassName ?: return null
-        return if (candidate.startsWith("$pkg.")) candidate else null
+        return if (candidate.startsWith("$pkg.")) resolveAliasClass(pkg, candidate) else null
     }
 
     /**
@@ -109,6 +133,15 @@ object GuestActivityTransmuter {
         // lectura de librerías desde DENTRO del juego sin salir de él.
         if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
             GuestFloatingBubble.attach(activity, packageName)
+        }
+
+        // Primera ventana visible + watchdog de pantalla blanca (engine v2.3):
+        // si en 10s nada dibujó, el informe se genera con el estado real de cada paso.
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            FirstDrawWatcher.watch(activity) {
+                GuestLaunchTracker.markFirstWindow(activity.javaClass.simpleName)
+            }
+            GuestLaunchTracker.scheduleWindowWatchdog(activity.applicationContext)
         }
     }
 
@@ -195,29 +228,76 @@ class AegisInstrumentation : Instrumentation() {
     override fun newActivity(cl: ClassLoader, className: String, intent: Intent): Activity {
         val guestClass = GuestActivityTransmuter.transmutableGuestClass(intent, className)
         if (guestClass != null) {
-            runCatching {
-                val loader = GuestSession.classLoader
-                    ?: error("classloader invitado no inicializado en GuestSession")
-                val real = loader.loadClass(guestClass).getDeclaredConstructor().newInstance() as Activity
-                Log.i("AegisInstrumentation", "STUB transmutado -> $guestClass")
-                return real
-            }.onFailure {
-                GuestSession.lastError =
-                    "newActivity($guestClass): ${it.javaClass.simpleName}: ${it.message ?: "sin mensaje"}"
-                Log.w("AegisInstrumentation", "transmutación falló (${it.javaClass.simpleName}: ${it.message}); se mantiene el stub")
+            val loader = GuestSession.classLoader
+            if (loader == null) {
+                val detail = "GuestSession.classLoader es NULL — sesión no inicializada en este proceso (¿proceso reiniciado?)"
+                GuestSession.lastError = "newActivity($guestClass): $detail"
+                GuestLaunchTracker.fail("newActivity", "$guestClass — $detail")
+                AegisLog.e("newActivity: $detail")
+            } else {
+                GuestLaunchTracker.loaderHashForNewActivity = System.identityHashCode(loader).toLong()
+                runCatching {
+                    val real = loader.loadClass(guestClass).getDeclaredConstructor().newInstance() as Activity
+                    GuestLaunchTracker.ok(
+                        "newActivity",
+                        "$guestClass instanciada (loader=0x${Integer.toHexString(System.identityHashCode(loader))})"
+                    )
+                    Log.i("AegisInstrumentation", "STUB transmutado -> $guestClass")
+                    return real
+                }.onFailure {
+                    val chain = GuestLaunchTracker.describeThrowable(it)
+                    GuestSession.lastError = "newActivity($guestClass): $chain"
+                    GuestLaunchTracker.exception(
+                        it,
+                        "newActivity: buscaba la clase $guestClass con el classloader del invitado (dexPath: ${GuestLaunchTracker.dexPath.ifBlank { "no registrado" }})"
+                    )
+                    GuestLaunchTracker.fail("newActivity", "$guestClass — $chain")
+                }
             }
         }
         return super.newActivity(cl, className, intent)
     }
 
     override fun callActivityOnCreate(activity: Activity, icicle: Bundle?) {
-        GuestActivityTransmuter.prepareGuestActivity(activity)
-        super.callActivityOnCreate(activity, icicle)
+        trackedOnCreate(activity, icicle, null, withPersistent = false)
     }
 
     override fun callActivityOnCreate(activity: Activity, icicle: Bundle?, persistentState: PersistableBundle?) {
+        trackedOnCreate(activity, icicle, persistentState, withPersistent = true)
+    }
+
+    /**
+     * Rastrea el onCreate REAL: "Activity.onCreate" es OK solo si el onCreate corrió sin
+     * lanzar excepción. La excepción se registra completa (con sus Caused by) y se
+     * re-lanza: el crash sandbox la guardará en el informe antes de morir.
+     */
+    private fun trackedOnCreate(
+        activity: Activity,
+        icicle: Bundle?,
+        persistentState: PersistableBundle?,
+        withPersistent: Boolean
+    ) {
         GuestActivityTransmuter.prepareGuestActivity(activity)
-        super.callActivityOnCreate(activity, icicle, persistentState)
+        val proxyTarget = activity.intent?.getStringExtra(GuestRuntimeEngine.EXTRA_GUEST_CLASS)
+        if (proxyTarget == null) {
+            // Actividad del motor (bootstrap): no es parte del ciclo de vida del invitado.
+            if (withPersistent) super.callActivityOnCreate(activity, icicle, persistentState!!)
+            else super.callActivityOnCreate(activity, icicle)
+            return
+        }
+        try {
+            if (withPersistent) super.callActivityOnCreate(activity, icicle, persistentState!!)
+            else super.callActivityOnCreate(activity, icicle)
+            val who = if (activity is BaseStubProcessActivity) "stub (transmutación fallida)" else activity.javaClass.name
+            GuestLaunchTracker.ok("Activity.onCreate", who)
+        } catch (t: Throwable) {
+            GuestLaunchTracker.exception(
+                t,
+                "Activity.onCreate de ${activity.javaClass.name} (proxy de $proxyTarget): el onCreate lanzó una excepción"
+            )
+            GuestLaunchTracker.fail("Activity.onCreate", GuestLaunchTracker.describeThrowable(t))
+            throw t
+        }
     }
 }
 
@@ -227,6 +307,14 @@ object ActivityThreadHook {
         HiddenApiExempt.exemptAll()
         val atClass = Class.forName("android.app.ActivityThread")
         atClass.getDeclaredMethod("currentActivityThread").apply { isAccessible = true }.invoke(null)
+    }.getOrNull()
+
+    /** Application del proceso actual vía ActivityThread (útil antes de que exista contexto). */
+    fun currentApplication(): Application? = runCatching {
+        HiddenApiExempt.exemptAll()
+        val atClass = Class.forName("android.app.ActivityThread")
+        atClass.getDeclaredMethod("currentApplication").apply { isAccessible = true }
+            .invoke(null) as? Application
     }.getOrNull()
 
     /** Sustituye la Instrumentation del proceso; false cuando la reflexión está bloqueada. */

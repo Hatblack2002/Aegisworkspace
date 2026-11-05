@@ -228,6 +228,22 @@ class VirtualEngineHost private constructor(private val appContext: Context) {
                     if (dest.exists()) dest.delete()
                     apkFile.copyTo(dest, overwrite = true)
                     dest.setReadable(true, false)
+                    // Verificación SHA-256 copia vs original (hilo IO): una copia truncada
+                    // produce ClassNotFoundException dispersas imposibles de diagnosticar.
+                    val srcHash = sha256Of(apkFile)
+                    val dstHash = sha256Of(dest)
+                    if (srcHash != null && dstHash != null && srcHash != dstHash) {
+                        Log.w(TAG, "Hash DISTINTO tras copiar ${dest.name} — re-copiando")
+                        dest.delete()
+                        apkFile.copyTo(dest, overwrite = true)
+                        if (sha256Of(dest) != srcHash) {
+                            Log.w(TAG, "La copia ${dest.name} sigue distinta del original (¿disco lleno?)")
+                        } else {
+                            Log.i(TAG, "Re-copia verificada: ${dest.name}")
+                        }
+                    }
+                    // Regla W^X: el dex solo se carga desde archivos de SOLO LECTURA.
+                    dest.setReadOnly()
                     copiedApks.add(dest)
                 }.onFailure {
                     Log.w(TAG, "No se pudo copiar ${apkFile.name} al sandbox: ${it.message}")
@@ -414,10 +430,21 @@ class VirtualEngineHost private constructor(private val appContext: Context) {
                 return DexProbeResult(false, "Los APKs no contienen classes*.dex (0 entradas) — APK sin código")
             }
 
-            val launcherClass = try {
+            val launcherAlias = try {
                 appContext.packageManager.getLaunchIntentForPackage(packageName)?.component?.className
             } catch (_: Exception) { null }
+            // CRÍTICO: el launcher de VLC/YouTube es un activity-alias — la clase real es
+            // targetActivity. Sondear el alias daría ClassNotFoundException POR DISEÑO.
+            val launcherClass = launcherAlias?.let { alias ->
+                runCatching {
+                    appContext.packageManager.getActivityInfo(android.content.ComponentName(packageName, alias), 0)
+                        ?.targetActivity ?: alias
+                }.getOrDefault(alias)
+            }
 
+            // Regla W^X: dex solo desde archivos de solo lectura (instalaciones antiguas
+            // pueden tener copias escribibles).
+            apkFiles.forEach { if (it.canWrite()) it.setReadOnly() }
             val optimizedDir = File(containerDir, "oat_probe").apply { mkdirs() }
             val dexPath = apkFiles.joinToString(File.pathSeparator) { it.absolutePath }
             val probeLoader = dalvik.system.DexClassLoader(
@@ -465,6 +492,20 @@ class VirtualEngineHost private constructor(private val appContext: Context) {
     }
 
     private data class DexProbeResult(val ok: Boolean, val message: String)
+
+    /** SHA-256 de un archivo; null si no se puede leer (informe e inventario). */
+    private fun sha256Of(file: File): String? = runCatching {
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buf = ByteArray(64 * 1024)
+            while (true) {
+                val read = input.read(buf)
+                if (read <= 0) break
+                digest.update(buf, 0, read)
+            }
+        }
+        digest.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
+    }.getOrNull()
 
     private fun extractGuestNativeLibraries(apkFiles: List<File>, destLibDir: File): AbiExtractionResult {
         val supportedAbis = Build.SUPPORTED_ABIS.toList()

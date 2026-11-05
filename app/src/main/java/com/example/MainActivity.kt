@@ -141,6 +141,12 @@ fun AegisEngineApp(
                         launchSingleTop = true
                     }
                 },
+                onOpenReport = { app ->
+                    context.startActivity(
+                        android.content.Intent(context, ReportActivity::class.java)
+                            .putExtra(ReportActivity.EXTRA_PACKAGE, app.info.packageName)
+                    )
+                },
                 onDeleteClone = { app ->
                     viewModel.deleteClonedApp(app.info.packageName)
                 }

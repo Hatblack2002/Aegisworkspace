@@ -35,6 +35,13 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Informe de fallos por clon (proceso principal: sobrevive a la muerte del guest) -->
+        <activity
+            android:name=".ReportActivity"
+            android:exported="false"
+            android:label="Informe de fallos"
+            android:theme="@style/Theme.MyApplication" />
     </application>
 
 </manifest>
