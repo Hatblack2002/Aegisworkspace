@@ -5,6 +5,7 @@ import android.app.Application
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.ServiceConnection
 import android.content.SharedPreferences
 import android.content.pm.ActivityInfo
 import android.content.pm.ApplicationInfo
@@ -185,6 +186,9 @@ object GuestRuntimeEngine {
             super.getSharedPreferences("$guestPackageName.${name ?: "default"}", mode)
 
         // ---- Enrutado de intents del invitado ---------------------------------
+        // Regla B.3: TODA salida del guest (activity, service, bind, broadcast)
+        // se reescribe a un proxy del host llevando el componente real del guest
+        // en extras. Nunca se deja que el AMS resuelva contra el sistema.
 
         private fun routedActivityIntent(intent: Intent): Intent {
             val stub = intent.component?.className
@@ -193,11 +197,78 @@ object GuestRuntimeEngine {
             return GuestIntentRouter.route(intent, guestPackageName, stub)
         }
 
+        /** Stub de servicio (mismo slot de proceso) para un componente del invitado. */
+        private fun routedServiceIntent(intent: Intent): Intent {
+            val suffix = if (GuestSession.stubProcessSuffix == ":p1") "P1" else "P0"
+            val routed = Intent(intent)
+            routed.component = ComponentName(
+                GuestSession.hostPackage.ifBlank { guestPackageName },
+                "com.aistudio.aegis.virtualcore.StubProcessService$suffix"
+            )
+            if (intent.component != null) {
+                routed.putExtra(GuestRuntimeEngine.EXTRA_GUEST_CLASS, intent.component!!.className)
+                routed.putExtra(GuestRuntimeEngine.EXTRA_PACKAGE_NAME, guestPackageName)
+            }
+            routed.`package` = null
+            return routed
+        }
+
         override fun startActivity(intent: Intent) =
             super.startActivity(routedActivityIntent(intent))
 
         override fun startActivity(intent: Intent, options: Bundle?) =
             super.startActivity(routedActivityIntent(intent), options)
+
+        override fun startService(intent: Intent): ComponentName? =
+            super.startService(routedServiceIntent(intent))
+
+        override fun startForegroundService(intent: Intent): ComponentName? =
+            super.startForegroundService(routedServiceIntent(intent))
+
+        override fun bindService(
+            intent: Intent,
+            conn: ServiceConnection,
+            flags: Int
+        ): Boolean {
+            val routed = routedServiceIntent(intent)
+            val bound = runCatching { super.bindService(routed, conn, flags) }
+                .getOrElse {
+                    GuestLaunchTracker.exception(
+                        it,
+                        "bindService del guest a ${intent.component?.className ?: intent.action ?: "implícito"}"
+                    )
+                    false
+                }
+            // Honesto: la conexión llega al PROXY del host (binder del host), no al
+            // binder original del guest. Se marca "no verificado" en el informe.
+            GuestLaunchTracker.unverified(
+                "bindService del guest",
+                "conectado al proxy ${routed.component?.className}; el binder original del guest no está virtualizado aún"
+            )
+            return bound
+        }
+
+        override fun sendBroadcast(intent: Intent) {
+            // Un broadcast EXPLÍCITO hacia un receiver del guest crashearía en el
+            // AMS (no exported / clase inexistente en el host). Los receivers del
+            // guest registrados en runtime sí los entregamos; los estáticos del
+            // manifest del guest quedan como aviso (pendiente de virtualizar).
+            val explicitToGuest = intent.component?.packageName == guestPackageName
+            if (explicitToGuest) {
+                GuestLaunchTracker.unverified(
+                    "sendBroadcast del guest",
+                    "broadcast explícito a ${intent.component?.className} retenido: receivers estáticos del guest pendientes de virtualizar"
+                )
+                AegisLog.w("broadcast del guest retenido: ${intent.component?.className ?: intent.action}")
+                return
+            }
+            super.sendBroadcast(intent)
+        }
+
+        override fun unbindService(conn: ServiceConnection) {
+            runCatching { super.unbindService(conn) }
+                .onFailure { AegisLog.w("unbindService del guest: ${it.message}") }
+        }
     }
 
     /** Stub (por launchMode y slot de proceso) para un componente del invitado. */
@@ -985,6 +1056,9 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
             //    a archivo del host, ANTES de que el proceso muera.
             runCatching {
                 GuestLaunchTracker.recordCrash(throwable)
+                // Razón de salida del AMS (best-effort aquí: el proceso aún vive;
+                // si no hay registro aún, el informe lo declara honestamente).
+                GuestLaunchTracker.queryProcessExitAsync(appContext, appContext.packageName, Process.myPid(), blocking = true)
                 GuestLaunchTracker.persistReport(
                     appContext, pkg,
                     "CRASH (excepción no capturada: ${throwable.javaClass.name}: ${throwable.message ?: "sin mensaje"})"

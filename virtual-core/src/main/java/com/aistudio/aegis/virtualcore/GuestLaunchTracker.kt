@@ -137,6 +137,12 @@ object GuestLaunchTracker {
 
     fun firstFailedStep(): Step? = synchronized(lock) { steps.firstOrNull { it.status == Status.FAIL } }
 
+    /**
+     * Último paso INICIADO (regla A.2): si el crash ocurre fuera de los pasos
+     * previstos, el handler global lo atribuye a este paso y lo marca ✘.
+     */
+    fun lastStartedStep(): Step? = synchronized(lock) { steps.lastOrNull() }
+
     /** Excepción REAL: cadena completa con todos los "Caused by". Nunca suposiciones. */
     fun exception(t: Throwable, contextWhatItWasLookingFor: String) {
         val chain = describeThrowable(t)
@@ -146,6 +152,16 @@ object GuestLaunchTracker {
 
     fun recordCrash(t: Throwable) {
         crashChain = describeThrowable(t)
+        // Regla A.2: el crash pertenece al último paso iniciado. Si aún no hay
+        // ningún paso marcado ✘, ese paso es el primer fallo real del intento.
+        val attributed = synchronized(lock) { steps.lastOrNull() }
+        if (attributed != null && firstFailedStep() == null) {
+            fail(
+                attributed.label,
+                "crash DURANTE este paso (atribuido por el handler global): " +
+                    (t.message ?: t.javaClass.simpleName)
+            )
+        }
     }
 
     fun snapshotExceptions(): List<String> = synchronized(lock) { exceptions.toList() }
@@ -204,6 +220,9 @@ object GuestLaunchTracker {
                     "Primera ventana visible",
                     "sin ventana en ${WATCHDOG_SECONDS}s — pantalla en blanco: el onCreate del invitado no llegó a dibujar (ver pasos y excepciones)"
                 )
+                // Regla A.5: consultar al AMS la razón de salida del proceso stub
+                // (crashes nativos y muertes que ningún handler Java ve).
+                queryProcessExitAsync(appContext, appContext.packageName, android.os.Process.myPid(), blocking = true)
                 persistReport(appContext, guestPackage, "PANTALLA EN BLANCO (sin ventana visible en ${WATCHDOG_SECONDS}s)")
             }
         }, WATCHDOG_SECONDS * 1000L)
@@ -278,6 +297,36 @@ object GuestLaunchTracker {
     }
 
     // ---------------------------------------------------------------- informe
+
+    // ------------------------------------------------ muerte del proceso (A.5)
+
+    /** Razón de salida del proceso stub, consultada por el host vía AMS. */
+    @Volatile var processExitReason: String = ""
+
+    /**
+     * El host consulta getHistoricalProcessExitReasons() del proceso stub:
+     * cubre crashes NATIVOS y muertes del proceso que ningún handler Java ve.
+     * API 29+; en versiones anteriores queda "no verificado" (nunca se inventa).
+     */
+    fun queryProcessExitAsync(appContext: Context, processPackage: String, pid: Int, blocking: Boolean = false) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            processExitReason = "(no verificado: getHistoricalProcessExitReasons requiere Android 10+)"
+            return
+        }
+        val worker = Thread {
+            val reason = runCatching {
+                val am = appContext.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+                val exits = am.getHistoricalProcessExitReasons(processPackage, pid, 1)
+                val e = exits.firstOrNull()
+                if (e == null) "(sin registro de salida para PID $pid)"
+                else "reason=${e.reason} subReason=${e.subReason} descripción=\"${e.description ?: ""}\""
+            }.getOrElse { "(no verificado: ${it.javaClass.simpleName}: ${it.message})" }
+            processExitReason = reason
+            AegisLog.i("salida del proceso stub: $reason")
+        }
+        worker.start()
+        if (blocking) runCatching { worker.join(4000) }
+    }
 
     /**
      * Genera el informe completo y lo persiste en el sandbox del host:
@@ -357,7 +406,30 @@ object GuestLaunchTracker {
         val exs = snapshotExceptions()
         if (crashChain != null) sb.appendLine("[crash no capturado del proceso]\n$crashChain\n")
         if (exs.isEmpty() && crashChain == null) sb.appendLine("(ninguna excepción registrada)")
-        exs.forEachIndexed { i, chain -> sb.appendLine("${i + 1}. $chain\n") }
+        exs.forEachIndexed { i, chain ->
+            sb.appendLine("${i + 1}. $chain")
+            KnownCauses.translate(chain)?.let { c ->
+                sb.appendLine("   → CAUSA CONOCIDA:")
+                sb.appendLine("     esperaba: ${c.esperaba}")
+                sb.appendLine("     encontró: ${c.encontro}")
+                sb.appendLine("     falta en el motor: ${c.falta}")
+            }
+            sb.appendLine()
+        }
+        if (crashChain != null) {
+            KnownCauses.translate(crashChain ?: "")?.let { c ->
+                sb.appendLine("   → CAUSA CONOCIDA (crash):")
+                sb.appendLine("     esperaba: ${c.esperaba}")
+                sb.appendLine("     encontró: ${c.encontro}")
+                sb.appendLine("     falta en el motor: ${c.falta}")
+                sb.appendLine()
+            }
+        }
+        sb.appendLine()
+
+        // 4.b Muerte del proceso (crashes NATIVOS y muertes que ningún handler Java ve)
+        sb.appendLine("== SALIDA DEL PROCESO STUB (AMS) ==")
+        sb.appendLine(processExitReason.ifBlank { "(no verificado: el host no consultó getHistoricalProcessExitReasons)" })
         sb.appendLine()
 
         // 5. APKs del invitado

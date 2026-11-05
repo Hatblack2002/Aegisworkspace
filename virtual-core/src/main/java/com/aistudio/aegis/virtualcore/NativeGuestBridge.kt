@@ -141,18 +141,52 @@ object NativeGuestBridge {
             }
         }
 
-        // Mapeo explícito de librerías del contenedor
+        // Mapeo explícito de librerías del contenedor, por ORDEN DE DEPENDENCIAS.
+        // Regla A.7: no podemos leer DT_NEEDED sin un parser ELF completo, así que
+        // usamos el algoritmo genérico equivalente: repetir rondas de dlopen hasta
+        // que no quede progreso. En cada ronda se carga lo que ya tiene sus
+        // dependencias mapeadas (o no las necesita); lo que falla espera a la
+        // siguiente. Un dlopen que falla es un AVISO, nunca un error del intento.
         preloadLibsDir?.let { dir ->
             if (dir.exists() && dir.isDirectory) {
-                val soFiles = dir.listFiles { file -> file.isFile && file.name.endsWith(".so") }.orEmpty()
+                val soFiles = dir.listFiles { file -> file.isFile && file.name.endsWith(".so") }
+                    .orEmpty()
+                    .sortedBy { it.name }
+                    .toMutableList()
                 Log.i(TAG, "Encontradas ${soFiles.size} librerías .so en el contenedor virtual de $packageName")
-                for (soFile in soFiles) {
-                    try {
-                        val dlResult = nativeDlopenLibrary(soFile.absolutePath)
-                        Log.i(TAG, "Mapeo de librería guest ${soFile.name}: $dlResult")
-                    } catch (t: Throwable) {
-                        Log.w(TAG, "Aviso al mapear ${soFile.name}: ${t.message}")
+                var round = 1
+                val finalErrors = mutableListOf<Pair<String, String>>()
+                while (soFiles.isNotEmpty()) {
+                    var progress = false
+                    val iterator = soFiles.iterator()
+                    while (iterator.hasNext()) {
+                        val soFile = iterator.next()
+                        val dlResult = runCatching { nativeDlopenLibrary(soFile.absolutePath) }
+                            .getOrElse { "EXCEPCIÓN: ${it.message}" }
+                        val loaded = !dlResult.contains("fail", ignoreCase = true) &&
+                            !dlResult.startsWith("EXCEPCIÓN") && !dlResult.startsWith("ERROR")
+                        if (loaded) {
+                            iterator.remove()
+                            progress = true
+                            Log.i(TAG, "Mapeo de librería guest ${soFile.name}: $dlResult (ronda $round)")
+                        } else {
+                            Log.i(TAG, "dlopen de ${soFile.name} pendiente (ronda $round): $dlResult")
+                            finalErrors.removeAll { it.first == soFile.name }
+                            finalErrors.add(soFile.name to (dlResult ?: "sin detalle"))
+                        }
                     }
+                    if (!progress) break // nada más cargable: las restantes faltan por dependencia
+                    round++
+                }
+                if (soFiles.isNotEmpty()) {
+                    Log.w(TAG, "${soFiles.size} librerías sin mapear tras $round rondas (aviso, no error)")
+                    GuestLaunchTracker.exception(
+                        IllegalStateException(
+                            "AVISO dlopen (no bloquea el intento): " +
+                                finalErrors.joinToString("; ") { (name, err) -> "$name → $err" }
+                        ),
+                        "librerías .so del guest que quedaron sin cargar (orden de dependencias)"
+                    )
                 }
             }
         }
