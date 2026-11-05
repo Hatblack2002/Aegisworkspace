@@ -306,11 +306,11 @@ object GuestLaunchTracker {
     /**
      * El host consulta getHistoricalProcessExitReasons() del proceso stub:
      * cubre crashes NATIVOS y muertes del proceso que ningún handler Java ve.
-     * API 29+; en versiones anteriores queda "no verificado" (nunca se inventa).
+     * API 30+ (Android 11); en versiones anteriores queda "no verificado" (nunca se inventa).
      */
     fun queryProcessExitAsync(appContext: Context, processPackage: String, pid: Int, blocking: Boolean = false) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            processExitReason = "(no verificado: getHistoricalProcessExitReasons requiere Android 10+)"
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            processExitReason = "(no verificado: getHistoricalProcessExitReasons requiere Android 11+)"
             return
         }
         val worker = Thread {
@@ -319,7 +319,7 @@ object GuestLaunchTracker {
                 val exits = am.getHistoricalProcessExitReasons(processPackage, pid, 1)
                 val e = exits.firstOrNull()
                 if (e == null) "(sin registro de salida para PID $pid)"
-                else "reason=${e.reason} subReason=${e.subReason} descripción=\"${e.description ?: ""}\""
+                else "reason=${e.reason} descripción=\"${e.description ?: ""}\""
             }.getOrElse { "(no verificado: ${it.javaClass.simpleName}: ${it.message})" }
             processExitReason = reason
             AegisLog.i("salida del proceso stub: $reason")
