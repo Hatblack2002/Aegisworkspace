@@ -135,20 +135,9 @@ object GuestRuntimeEngine {
         }
 
         // ---- PackageManager del invitado ---------------------------------------
-        // El dataDir/nativeLibraryDir REALES apuntan a otro UID (EACCES). El proxy
-        // redirige esas rutas al sandbox y ruthea el launch intent del propio invitado
-        // hacia los stubs correspondientes.
-
-        private val guestPackageManager: PackageManager by lazy {
-            GuestPackageManager(
-                guestPackageName = guestPackageName,
-                sandboxRoot = sandboxRoot,
-                guestAppInfo = guestAppInfo,
-                base = super.getPackageManager()
-            )
-        }
-
-        override fun getPackageManager(): PackageManager = guestPackageManager
+        // getApplicationInfo() ya está parcheado arriba (ApplicationInfo del sandbox),
+        // y el PackageManager real del host funciona porque el invitado ES una app
+        // instalada (firmas/activities correctas por diseño).
 
         // ---- Almacenamiento redirigido al sandbox -----------------------------
 
@@ -846,54 +835,4 @@ class StubProcessActivityP0SingleInstance : BaseStubProcessActivity(":p0")
 class StubProcessActivityP1SingleTop : BaseStubProcessActivity(":p1")
 class StubProcessActivityP1SingleTask : BaseStubProcessActivity(":p1")
 class StubProcessActivityP1SingleInstance : BaseStubProcessActivity(":p1")
-
-/**
- * Proxy de PackageManager para el invitado: delega TODO en el PackageManager real
- * (el invitado ES una app instalada, así que firmas/activities/permisos son correctos)
- * y solo parchea lo que apunta a OTRO UID:
- *  - getApplicationInfo(guest): dataDir / deviceProtectedDataDir / nativeLibraryDir
- *    re-direccionados al sandbox (el real daría EACCES al primer File()).
- *  - getLaunchIntentForPackage(guest): re-enrutado a los stubs del launchMode correcto.
- */
-private class GuestPackageManager(
-    private val guestPackageName: String,
-    private val sandboxRoot: File,
-    private val guestAppInfo: ApplicationInfo?,
-    private val base: PackageManager
-) : PackageManager() by base {
-
-    private fun patched(info: ApplicationInfo): ApplicationInfo = ApplicationInfo(info).apply {
-        dataDir = sandboxRoot.absolutePath
-        deviceProtectedDataDir = File(sandboxRoot, "device_protected").absolutePath
-        nativeLibraryDir = File(sandboxRoot, "lib").absolutePath
-        processName = guestPackageName
-    }
-
-    override fun getApplicationInfo(packageName: String, flags: Int): ApplicationInfo {
-        val info = base.getApplicationInfo(packageName, flags)
-        return if (packageName == guestPackageName) patched(info) else info
-    }
-
-    override fun getApplicationInfo(
-        packageName: String,
-        flags: PackageManager.ApplicationInfoFlags
-    ): ApplicationInfo {
-        val info = base.getApplicationInfo(packageName, flags)
-        return if (packageName == guestPackageName) patched(info) else info
-    }
-
-    override fun getLaunchIntentForPackage(packageName: String): Intent? {
-        if (packageName != guestPackageName) return base.getLaunchIntentForPackage(packageName)
-        val launch = base.getLaunchIntentForPackage(packageName) ?: return null
-        val className = launch.component?.className ?: return launch
-        return Intent(launch).apply {
-            component = android.content.ComponentName(
-                GuestSession.hostPackage.ifBlank { guestPackageName },
-                GuestRuntimeEngine.stubActivityNameFor(className)
-            )
-            putExtra(GuestRuntimeEngine.EXTRA_GUEST_CLASS, className)
-            putExtra(GuestRuntimeEngine.EXTRA_PACKAGE_NAME, guestPackageName)
-        }
-    }
-}
 
