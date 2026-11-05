@@ -188,11 +188,12 @@ class AegisViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Flujo completo de Clonado y Ejecución (Sección 4 y 5.6):
-     * 1. Estado "Instalando en el contenedor…"
-     * 2. Estado "Iniciando proceso…"
-     * 3. Estado "Leyendo librerías…"
-     * 4. Navega automáticamente a la pantalla de Resultado (Verde o Rojo).
+     * ENGINE v2 — Clonado con lanzamiento DIRECTO:
+     * 1. Instala el contenedor (copia APKs al sandbox + sonda dex honesta).
+     * 2. Lanza la app en pantalla completa INMEDIATAMENTE.
+     * La lectura de librerías YA NO bloquea el arranque: se hace en segundo plano
+     * desde el proceso stub, y el usuario puede dispararla cuando quiera desde la
+     * burbuja flotante (dentro de la app) o desde el menú "Diagnosticar librerías".
      */
     fun cloneAndLaunchSelectedApp(
         packageName: String,
@@ -207,7 +208,6 @@ class AegisViewModel(application: Application) : AndroidViewModel(application) {
                 appName = displayName,
                 stepMessage = "Instalando en el contenedor…"
             )
-            delay(350)
 
             val installResult = engineHost.installAppInVirtualContainer(packageName)
             if (installResult.isFailure) {
@@ -222,7 +222,10 @@ class AegisViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             val clonedInfo = installResult.getOrThrow()
-            executeCloneProcess(clonedInfo, simulateReadFailure = false, onNavigateToResult = onNavigateToResult)
+            clearSelection()
+            _uiState.value = UiState.Idle
+            // Ejecutar primero (engine v2). El diagnóstico de librerías es opcional.
+            engineHost.launchClonedAppFullscreenActivity(clonedInfo)
         }
     }
 

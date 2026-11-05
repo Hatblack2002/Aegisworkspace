@@ -308,6 +308,21 @@ object GuestRuntimeEngine {
         return files
     }
 
+    /**
+     * ENGINE v2: APKs de EJECUCIÓN del invitado — prioriza las COPIAS del sandbox
+     * (virtual_env/<pkg>/apk/, creadas al clonar). Las copias son inmunes a rutas
+     * /data/app renombradas por actualizaciones y a restricciones del ROM. Si no
+     * existen (clon antiguo), cae a las rutas reales del PackageManager.
+     */
+    fun resolveRuntimeApkFiles(context: Context, packageName: String, fallbackApkPath: String): List<File> {
+        val sandboxApkDir = File(context.filesDir, "virtual_env/$packageName/apk")
+        val copies = sandboxApkDir.listFiles { f -> f.isFile && f.name.endsWith(".apk") }
+            ?.sortedBy { it.name }
+            .orEmpty()
+        if (copies.isNotEmpty()) return copies
+        return resolveAllApkFiles(context, packageName, fallbackApkPath)
+    }
+
     // ---- ClassLoader compartido por proceso ----------------------------------
 
     private val loadersByPackage = HashMap<String, DexClassLoader>()
@@ -624,8 +639,8 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
         try {
             HiddenApiExempt.exemptAll()
 
-            val allApkFiles = GuestRuntimeEngine.resolveAllApkFiles(this, packageName, apkPath)
-            diagnostics += "APKs huésped: ${allApkFiles.size}"
+            val allApkFiles = GuestRuntimeEngine.resolveRuntimeApkFiles(this, packageName, apkPath)
+            diagnostics += "APKs huésped: ${allApkFiles.size} (${if (allApkFiles.firstOrNull()?.parentFile?.name == "apk") "copias sandbox" else "rutas del sistema"})"
             val guestLoader = GuestRuntimeEngine.loaderFor(this, packageName, allApkFiles, containerDir, nativeLibDir)
             if (guestLoader == null) {
                 diagnostics += "Classloader: FALLO (DexClassLoader no creado)"
@@ -659,7 +674,12 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
                 val guestApp = GuestRuntimeEngine.hostGuestApplication(
                     applicationContext, packageName, guestLoader
                 )
-                diagnostics += "Application invitado: ${if (guestApp != null) "OK" else "genérico/falló"}"
+                diagnostics += "Application invitado: " + when {
+                    guestApp == null -> "FALLO"
+                    guestApp.javaClass == android.app.Application::class.java ->
+                        "GENÉRICO (la clase declarada no cargó — revisa la sonda dex del clon)"
+                    else -> "OK (${guestApp.javaClass.name})"
+                }
 
                 // Hooks de transmutación: los stubs pasan a ser actividades reales del invitado.
                 val hooksOk = ActivityThreadHook.installIfNeeded()
@@ -700,6 +720,10 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
             }
             showFullscreenProcessWorkspace(rootContainer, packageName, diagnostics)
         }
+
+        // Burbuja flotante (engine v2): diagnóstico de librerías sin salir de la app,
+        // para invitados que solo expongen sus .so una vez dentro del juego.
+        GuestFloatingBubble.attach(this, packageName)
 
         // Telemetría asíncrona (mapeo .so + /proc/self/maps + reporte al host)
         Thread {
@@ -823,6 +847,7 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
     }
 
     override fun onDestroy() {
+        GuestFloatingBubble.detach(this)
         super.onDestroy()
     }
 }

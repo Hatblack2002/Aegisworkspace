@@ -93,6 +93,12 @@ object GuestActivityTransmuter {
             }
         }
         Log.i(TAG, "actividad invitado preparada: $guestClassName")
+
+        // Burbuja flotante sobre la UI del invitado (engine v2): permite disparar la
+        // lectura de librerías desde DENTRO del juego sin salir de él.
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            GuestFloatingBubble.attach(activity, packageName)
+        }
     }
 
     /**

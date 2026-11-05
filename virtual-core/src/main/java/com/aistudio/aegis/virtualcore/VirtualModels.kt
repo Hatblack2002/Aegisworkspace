@@ -122,6 +122,12 @@ data class GuestMapsReport(
 
 /**
  * Representa una aplicación instalada en el contenedor virtual de Aegis Engine.
+ *
+ * Campos v2 (engine redesign):
+ *  - sandboxApkPaths: COPIAS de base.apk + splits dentro del sandbox (el guest corre
+ *    desde su propia copia, inmune a rutas /data/app que cambian o se restringen).
+ *  - launchProbeOk / launchProbeMessage: veredicto HONESTO de la sonda dex ejecutada
+ *    en el momento del clonado (¿ART puede cargar realmente el código de esta app?).
  */
 data class ClonedAppInfo(
     val packageName: String,
@@ -135,5 +141,8 @@ data class ClonedAppInfo(
     val clonedAtMs: Long,
     val isCompatibleAbi: Boolean = true,
     val incompatibilityReason: String? = null,
-    val lastReport: GuestMapsReport? = null
+    val lastReport: GuestMapsReport? = null,
+    val sandboxApkPaths: List<String> = emptyList(),
+    val launchProbeOk: Boolean? = null,
+    val launchProbeMessage: String? = null
 )

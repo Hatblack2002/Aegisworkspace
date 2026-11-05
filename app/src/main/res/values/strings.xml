@@ -11,7 +11,7 @@
     <string name="search_placeholder">Buscar app o paquete…</string>
     <string name="btn_clone_none">Selecciona una app</string>
     <string name="btn_clone_one">Clonar 1 app</string>
-    <string name="menu_rerun">Reejecutar</string>
+    <string name="menu_rerun">Diagnosticar librerías</string>
     <string name="menu_view_result">Ver resultado</string>
     <string name="menu_delete_clone">Eliminar clon</string>
     <string name="status_green_title">VERDE</string>

@@ -68,6 +68,14 @@ class VirtualEngineHost private constructor(private val appContext: Context) {
                 val report = reportObj?.let {
                     GuestMapsReport.fromContractOrFullJson(it.toString(), assignedProc)
                 }
+                val sandboxApkPaths = mutableListOf<String>()
+                val pathsArr = obj.optJSONArray("sandboxApkPaths")
+                if (pathsArr != null) {
+                    for (p in 0 until pathsArr.length()) {
+                        val path = pathsArr.optString(p)
+                        if (path.isNotBlank()) sandboxApkPaths.add(path)
+                    }
+                }
                 list.add(
                     ClonedAppInfo(
                         packageName = pkg,
@@ -81,7 +89,10 @@ class VirtualEngineHost private constructor(private val appContext: Context) {
                         clonedAtMs = obj.optLong("clonedAtMs", System.currentTimeMillis()),
                         isCompatibleAbi = obj.optBoolean("isCompatibleAbi", true),
                         incompatibilityReason = if (obj.isNull("incompatibilityReason")) null else obj.optString("incompatibilityReason").takeIf { it.isNotBlank() },
-                        lastReport = report
+                        lastReport = report,
+                        sandboxApkPaths = sandboxApkPaths,
+                        launchProbeOk = if (obj.isNull("launchProbeOk")) null else obj.optBoolean("launchProbeOk", false),
+                        launchProbeMessage = if (obj.isNull("launchProbeMessage")) null else obj.optString("launchProbeMessage").takeIf { it.isNotBlank() }
                     )
                 )
             }
@@ -116,6 +127,19 @@ class VirtualEngineHost private constructor(private val appContext: Context) {
                 obj.put("lastReport", item.lastReport.toFullStorageJson())
             } else {
                 obj.put("lastReport", JSONObject.NULL)
+            }
+            val pathsArray = JSONArray()
+            item.sandboxApkPaths.forEach { pathsArray.put(it) }
+            obj.put("sandboxApkPaths", pathsArray)
+            if (item.launchProbeOk != null) {
+                obj.put("launchProbeOk", item.launchProbeOk)
+            } else {
+                obj.put("launchProbeOk", JSONObject.NULL)
+            }
+            if (item.launchProbeMessage != null) {
+                obj.put("launchProbeMessage", item.launchProbeMessage)
+            } else {
+                obj.put("launchProbeMessage", JSONObject.NULL)
             }
             array.put(obj)
         }
@@ -193,6 +217,29 @@ class VirtualEngineHost private constructor(private val appContext: Context) {
                     "extraídas=${extractionSummary.extractedCount} librerías .so en ${nativeLibDir.absolutePath}"
             )
 
+            // ENGINE v2 (1/2): copiar base.apk + splits al sandbox. El invitado corre desde
+            // SU PROPIA copia: inmune a rutas /data/app que cambian al actualizarse la app
+            // original y a restricciones del ROM sobre leer APKs de otras apps.
+            val apkCopyDir = File(containerDir, "apk").apply { mkdirs() }
+            val copiedApks = mutableListOf<File>()
+            apkFiles.forEachIndexed { index, apkFile ->
+                runCatching {
+                    val dest = File(apkCopyDir, if (index == 0) "base.apk" else "split_config_${index}.apk")
+                    if (dest.exists()) dest.delete()
+                    apkFile.copyTo(dest, overwrite = true)
+                    dest.setReadable(true, false)
+                    copiedApks.add(dest)
+                }.onFailure {
+                    Log.w(TAG, "No se pudo copiar ${apkFile.name} al sandbox: ${it.message}")
+                }
+            }
+            Log.i(TAG, "Copias sandbox de $packageName: ${copiedApks.size}/${apkFiles.size} APKs en ${apkCopyDir.absolutePath}")
+
+            // ENGINE v2 (2/2): sonda dex HONESTA. Antes 'ClassLoader: OK' solo significaba
+            // que el constructor no lanzó; con esto se sabe ANTES de lanzar si ART puede
+            // cargar el código real de esta app (evita el ClassNotFound del YouTube v1).
+            val dexProbe = probeGuestDex(copiedApks.ifEmpty { apkFiles }, containerDir, nativeLibDir, packageName)
+
             val clonedInfo = ClonedAppInfo(
                 packageName = packageName,
                 appName = label,
@@ -205,7 +252,10 @@ class VirtualEngineHost private constructor(private val appContext: Context) {
                 clonedAtMs = System.currentTimeMillis(),
                 isCompatibleAbi = extractionSummary.isAbiCompatible,
                 incompatibilityReason = extractionSummary.incompatibilityReason,
-                lastReport = _clonedApps.value.find { it.packageName == packageName }?.lastReport
+                lastReport = _clonedApps.value.find { it.packageName == packageName }?.lastReport,
+                sandboxApkPaths = copiedApks.map { it.absolutePath },
+                launchProbeOk = dexProbe.ok,
+                launchProbeMessage = dexProbe.message
             )
 
             synchronized(this@VirtualEngineHost) {
@@ -330,6 +380,88 @@ class VirtualEngineHost private constructor(private val appContext: Context) {
         val isAbiCompatible: Boolean,
         val incompatibilityReason: String?
     )
+
+    /**
+     * Sonda dex (engine v2): crea un DexClassLoader desechable sobre los APKs del invitado
+     * e intenta cargar la clase Application y la clase LAUNCHER reales.
+     * Resultado verdadero de "¿esta app puede ejecutarse en el motor?" — no un simple
+     * "el constructor no lanzó". Nunca lanza: devuelve el veredicto y el motivo.
+     */
+    private fun probeGuestDex(
+        apkFiles: List<File>,
+        containerDir: File,
+        nativeLibDir: File,
+        packageName: String
+    ): DexProbeResult {
+        if (apkFiles.isEmpty()) {
+            return DexProbeResult(false, "Sin APKs del invitado para cargar código")
+        }
+        return try {
+            // Inventario dex: detecta base.apk sin código (stub/empty) de un vistazo.
+            var dexEntries = 0
+            for (apk in apkFiles) {
+                runCatching {
+                    java.util.zip.ZipFile(apk).use { zip ->
+                        val names = zip.entries().asSequence().map { it.name }
+                        dexEntries += names.count { it.matches(Regex("classes[0-9]*\\.dex")) }
+                    }
+                }
+            }
+            if (dexEntries == 0) {
+                return DexProbeResult(false, "Los APKs no contienen classes*.dex (0 entradas) — APK sin código")
+            }
+
+            val launcherClass = try {
+                appContext.packageManager.getLaunchIntentForPackage(packageName)?.component?.className
+            } catch (_: Exception) { null }
+
+            val optimizedDir = File(containerDir, "oat_probe").apply { mkdirs() }
+            val dexPath = apkFiles.joinToString(File.pathSeparator) { it.absolutePath }
+            val probeLoader = dalvik.system.DexClassLoader(
+                dexPath,
+                optimizedDir.absolutePath,
+                nativeLibDir.absolutePath,
+                appContext.classLoader
+            )
+
+            var appClassOk: Boolean? = null
+            var appClassError: String? = null
+            try {
+                val appClassName = appContext.packageManager.getApplicationInfo(packageName, 0).className
+                if (!appClassName.isNullOrBlank()) {
+                    probeLoader.loadClass(appClassName)
+                    appClassOk = true
+                }
+            } catch (t: Throwable) {
+                appClassOk = false
+                appClassError = t.message ?: t.javaClass.simpleName
+            }
+
+            var launcherOk: Boolean? = null
+            var launcherError: String? = null
+            if (launcherClass != null) {
+                try {
+                    probeLoader.loadClass(launcherClass)
+                    launcherOk = true
+                } catch (t: Throwable) {
+                    launcherOk = false
+                    launcherError = t.message ?: t.javaClass.simpleName
+                }
+            }
+
+            val ok = (appClassOk != false) && (launcherOk != false)
+            val message = when {
+                ok -> "dex OK ($dexEntries entradas; aplicación y lanzador cargan)"
+                launcherOk == false -> "ART no pudo cargar el LAUNCHER ($launcherClass): $launcherError"
+                else -> "ART no pudo cargar la Application: $appClassError"
+            }
+            DexProbeResult(ok, message)
+        } catch (t: Throwable) {
+            DexProbeResult(false, "Sonda dex falló: ${t.javaClass.simpleName}: ${t.message}")
+        }
+    }
+
+    private data class DexProbeResult(val ok: Boolean, val message: String)
 
     private fun extractGuestNativeLibraries(apkFiles: List<File>, destLibDir: File): AbiExtractionResult {
         val supportedAbis = Build.SUPPORTED_ABIS.toList()

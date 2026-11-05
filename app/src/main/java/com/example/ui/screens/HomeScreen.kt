@@ -130,7 +130,7 @@ fun HomeScreen(
 
                 if (clonedApps.isNotEmpty()) {
                     Text(
-                        text = "Toque rápido para lanzar en :p0 / :p1 · Mantén pulsado un icono para ver opciones",
+                        text = "Toque: ejecutar la app ya · Mantén pulsado: diagnosticar librerías y más opciones",
                         style = MaterialTheme.typography.labelMedium,
                         color = AegisOnSurfaceVariant,
                         textAlign = TextAlign.Center,
