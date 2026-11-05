@@ -445,6 +445,10 @@ object GuestRuntimeEngine {
             Log.i(TAG, "lanzamiento del invitado por stub=${stubClass.simpleName}: $guestClassName")
             true
         } catch (t: Throwable) {
+            // Motivo EXACTO del fallo: se muestra en la pantalla de diagnóstico del stub
+            // (GuestSession.lastError -> "Error: ..."), no solo en logcat.
+            GuestSession.lastError =
+                "startActivity($guestClassName): ${t.javaClass.simpleName}: ${t.message ?: "sin mensaje"}"
             Log.w(TAG, "lanzamiento del invitado falló: ${t.message}")
             false
         }
@@ -687,16 +691,25 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
                 Log.i(TAG, "Instrumentation transmutadora ${if (hooksOk) "instalada" else "NO disponible"} en $stubSuffix")
 
                 if (launchUi && hooksOk) {
-                    val guestClassName = intentData.getStringExtra(GuestRuntimeEngine.EXTRA_GUEST_CLASS)
-                        ?: findLaunchActivityClassName(packageName)
-                    if (guestClassName.isNullOrBlank()) {
-                        diagnostics += "Lanzador del invitado: NO ENCONTRADO"
+                    val proxyTarget = intentData.getStringExtra(GuestRuntimeEngine.EXTRA_GUEST_CLASS)
+                    if (!proxyTarget.isNullOrBlank()) {
+                        // Este stub fue lanzado como PROXY de una actividad del invitado.
+                        // Si su onCreate llegó a correr es porque AegisInstrumentation.newActivity
+                        // NO logró transmutar la instancia (el framework creó el stub en lugar de
+                        // la clase real del invitado). Se muestra el motivo exacto y NO se
+                        // re-lanza: re-lanzar aquí produciría una recursión infinita de stubs.
+                        diagnostics += "Transmutación de instancia: FALLO (stub creado en vez de $proxyTarget)"
                     } else {
-                        diagnostics += "Lanzador: $guestClassName"
-                        if (GuestRuntimeEngine.launchGuestActivityFrom(this, guestClassName)) {
-                            transmutationReady = true
+                        val guestClassName = findLaunchActivityClassName(packageName)
+                        if (guestClassName.isNullOrBlank()) {
+                            diagnostics += "Lanzador del invitado: NO ENCONTRADO"
                         } else {
-                            diagnostics += "startActivity del invitado: FALLO"
+                            diagnostics += "Lanzador: $guestClassName"
+                            if (GuestRuntimeEngine.launchGuestActivityFrom(this, guestClassName)) {
+                                transmutationReady = true
+                            } else {
+                                diagnostics += "startActivity del proxy: FALLO"
+                            }
                         }
                     }
                 }
@@ -742,7 +755,21 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
     private fun installStubCrashSandbox() {
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
             val pkg = intent?.getStringExtra(GuestRuntimeEngine.EXTRA_PACKAGE_NAME) ?: "App clonada"
-            val errorMsg = "La app se cerró inesperadamente (${throwable.javaClass.simpleName}: ${throwable.message})"
+            // Resumen honesto del fallo: clase exacta + primer "Caused by" de la cadena,
+            // para diagnosticar sin logcat (mismo dato que filtrar por AndroidRuntime).
+            val firstCause = runCatching { Log.getStackTraceString(throwable) }.getOrNull()
+                ?.lineSequence()
+                ?.map { it.trimStart() }
+                ?.firstOrNull { it.startsWith("Caused by:") }
+            val errorMsg = buildString {
+                append("La app se cerró inesperadamente (")
+                append(throwable.javaClass.name)
+                append(": ")
+                append(throwable.message ?: "sin mensaje")
+                append(")")
+                firstCause?.let { append(" · "); append(it.take(200)) }
+            }
+            GuestSession.lastError = errorMsg
             Log.e(TAG, "Aegis Crash Sandbox capturó fallo en proceso $stubSuffix: $errorMsg", throwable)
 
             // 1. Notificar al host mediante ContentProvider

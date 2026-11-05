@@ -349,7 +349,10 @@ class VirtualEngineHost private constructor(private val appContext: Context) {
         }
 
         val activityIntent = Intent(appContext, activityClass).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_MULTIPLE_TASK)
+            // NEW_TASK sin MULTIPLE_TASK: una sola tarea por app clonada. Con MULTIPLE_TASK
+            // cada toque creaba una tarea paralela y el singleTask del invitado quedaba
+            // anulado (pilas de tareas confusas al volver atrás).
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             putExtra(GuestRuntimeEngine.EXTRA_PACKAGE_NAME, clonedApp.packageName)
             putExtra(GuestRuntimeEngine.EXTRA_APK_PATH, clonedApp.sourceApkPath)
             putExtra(GuestRuntimeEngine.EXTRA_CONTAINER_DIR, clonedApp.virtualContainerDir)

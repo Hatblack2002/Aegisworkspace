@@ -74,6 +74,16 @@ object GuestActivityTransmuter {
         // contra los recursos equivocados -> NotFoundException -> pantalla blanca/crash.
         clearThemedContextCaches(activity)
 
+        // 1c. CRÍTICO (pantalla roja/blanca en el PRIMER setContentView): PhoneWindow
+        // cachea su PROPIO LayoutInflater en attach() ("mLayoutInflater =
+        // LayoutInflater.from(context)") con el ContextImpl del STUB. clearThemedContextCaches
+        // no alcanza: la Activity llama a setContentView -> mWindow.setContentView ->
+        // mLayoutInflater.inflate(layoutRes) y ESE inflater resuelve los IDs 0x7f del
+        // invitado contra los Resources del HOST -> Resources$NotFoundException.
+        // Se sustituye por un clon ligado al contexto virtual (mismas factories,
+        // getResources() -> AssetManager del invitado).
+        patchWindowInflater(activity)
+
         // 2. getApplication() debe devolver el Application del invitado.
         GuestSession.application?.let { app ->
             runCatching { activityField("mApplication").set(activity, app) }
@@ -124,6 +134,24 @@ object GuestActivityTransmuter {
 
     private val CACHEABLE_FIELDS = arrayOf("mTheme", "mResources", "mInflater")
 
+    /**
+     * Sustituye el LayoutInflater cacheado por PhoneWindow (creado en attach() contra el
+     * ContextImpl del host) por un clon ligado al contexto virtual del invitado.
+     * Best-effort: si el campo cambia de nombre entre ROMs, se degrada sin romper.
+     */
+    private fun patchWindowInflater(activity: Activity) {
+        runCatching {
+            val window = activity.window ?: return
+            val virtualInflater = activity.getSystemService(Context.LAYOUT_INFLATER_SERVICE) as? LayoutInflater
+                ?: return
+            val field = window.javaClass.getDeclaredField("mLayoutInflater")
+            field.isAccessible = true
+            field.set(window, virtualInflater)
+        }.onFailure {
+            Log.w(TAG, "No se pudo parchear el inflater de la ventana: ${it.message}")
+        }
+    }
+
     private fun activityField(name: String): Field =
         Activity::class.java.getDeclaredField(name).apply { isAccessible = true }
 
@@ -173,7 +201,8 @@ class AegisInstrumentation : Instrumentation() {
                 Log.i("AegisInstrumentation", "STUB transmutado -> $guestClass")
                 return real
             }.onFailure {
-                GuestSession.lastError = "loadClass($guestClass): ${it.javaClass.simpleName}: ${it.message}"
+                GuestSession.lastError =
+                    "newActivity($guestClass): ${it.javaClass.simpleName}: ${it.message ?: "sin mensaje"}"
                 Log.w("AegisInstrumentation", "transmutación falló (${it.javaClass.simpleName}: ${it.message}); se mantiene el stub")
             }
         }
