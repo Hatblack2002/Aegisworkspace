@@ -14,14 +14,73 @@
             android:exported="false"
             android:process=":p0"
             android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar"
-            android:configChanges="orientation|screenSize|keyboardHidden" />
+            android:taskAffinity=""
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|locale|colorMode|touchscreen|mcc|mnc" />
 
         <activity
             android:name="com.aistudio.aegis.virtualcore.StubProcessActivityP1"
             android:exported="false"
             android:process=":p1"
             android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar"
-            android:configChanges="orientation|screenSize|keyboardHidden" />
+            android:taskAffinity=""
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|locale|colorMode|touchscreen|mcc|mnc" />
+
+        <!-- Un stub por launchMode y slot: el framework aplica el launchMode DECLARADO
+             del stub (Chrome declara singleTask; muchos juegos singleTask/singleInstance).
+             taskAffinity="" mantiene las tareas del invitado fuera de la tarea de Aegis. -->
+        <activity
+            android:name="com.aistudio.aegis.virtualcore.StubProcessActivityP0SingleTop"
+            android:exported="false"
+            android:process=":p0"
+            android:launchMode="singleTop"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|locale|colorMode|touchscreen|mcc|mnc" />
+
+        <activity
+            android:name="com.aistudio.aegis.virtualcore.StubProcessActivityP0SingleTask"
+            android:exported="false"
+            android:process=":p0"
+            android:launchMode="singleTask"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|locale|colorMode|touchscreen|mcc|mnc" />
+
+        <activity
+            android:name="com.aistudio.aegis.virtualcore.StubProcessActivityP0SingleInstance"
+            android:exported="false"
+            android:process=":p0"
+            android:launchMode="singleInstance"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|locale|colorMode|touchscreen|mcc|mnc" />
+
+        <activity
+            android:name="com.aistudio.aegis.virtualcore.StubProcessActivityP1SingleTop"
+            android:exported="false"
+            android:process=":p1"
+            android:launchMode="singleTop"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|locale|colorMode|touchscreen|mcc|mnc" />
+
+        <activity
+            android:name="com.aistudio.aegis.virtualcore.StubProcessActivityP1SingleTask"
+            android:exported="false"
+            android:process=":p1"
+            android:launchMode="singleTask"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|locale|colorMode|touchscreen|mcc|mnc" />
+
+        <activity
+            android:name="com.aistudio.aegis.virtualcore.StubProcessActivityP1SingleInstance"
+            android:exported="false"
+            android:process=":p1"
+            android:launchMode="singleInstance"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|locale|colorMode|touchscreen|mcc|mnc" />
 
         <service
             android:name="com.aistudio.aegis.virtualcore.StubProcessServiceP0"

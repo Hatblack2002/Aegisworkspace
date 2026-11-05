@@ -4,32 +4,47 @@ import android.app.Activity
 import android.app.Application
 import android.app.Service
 import android.content.Context
-import android.content.ContextWrapper
 import android.content.Intent
+import android.content.SharedPreferences
 import android.content.pm.ActivityInfo
-import android.content.pm.PackageManager
+import android.content.pm.ApplicationInfo
 import android.content.res.AssetManager
-import android.content.res.Configuration
 import android.content.res.Resources
+import android.database.sqlite.SQLiteDatabase
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.os.Looper
 import android.os.Process
 import android.util.Log
 import android.view.Gravity
-import android.view.View
 import android.view.ViewGroup
+import android.widget.Button
 import android.widget.FrameLayout
+import android.widget.LinearLayout
 import android.widget.TextView
 import dalvik.system.DexClassLoader
 import java.io.File
-import java.io.FileDescriptor
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.lang.reflect.Method
 
 /**
  * Cargador y entorno de ejecución cooperativo para el proceso clonado (:p0, :p1).
+ *
+ * Correcciones v1.1 (pantalla blanca en Chrome/juegos):
+ *  - El stub AHORA transmuta de verdad: instala [AegisInstrumentation] en el
+ *    ActivityThread del proceso y lanza el Activity real del invitado; el huesped
+ *    ejecuta su onCreate con su propio tema y recursos (antes la instancia se creaba
+ *    sin attach() y nunca entraba en ciclo de vida: el huesped jamás se dibujaba).
+ *  - VirtualGuestContext redirige TODO el almacenamiento al sandbox real del proceso
+ *    de Aegis. Las rutas estándar del invitado (/data/user/0/<pkg>/) eran inaccesibles
+ *    (EACCES: otro UID) y crasheaban al primer File(getFilesDir()).
+ *  - El Application del invitado se adjunta con Application.attach() (no attachBaseContext)
+ *    y su onCreate corre en el HILO PRINCIPAL del proceso stub.
+ *  - Los Resources del invitado incluyen framework-res.apk (antes faltaba y el inflate
+ *    de cualquier layout con atributos android: crasheaba -> pantalla blanca).
+ *  - Un stub por launchMode (Chrome declara singleTask; varios juegos singleInstance).
  */
 object GuestRuntimeEngine {
     private const val TAG = "AegisGuest"
@@ -41,98 +56,187 @@ object GuestRuntimeEngine {
     const val EXTRA_PROCESS_NAME = "extra_guest_process_name"
     const val EXTRA_LAUNCH_UI = "extra_guest_launch_ui"
     const val EXTRA_FORCE_ERROR = "extra_guest_force_error"
+    const val EXTRA_GUEST_CLASS = "extra_guest_class"
 
     /**
-     * VFS Transparente:
-     * Cuando la app clonada consulta sus rutas estándar (getFilesDir(), getDataDir(), getCacheDir()),
-     * el sistema le devuelve la representación con la ruta estándar (/data/user/0/<packageName>/...),
-     * pero las operaciones de E/S reales (openFileInput, openFileOutput, etc.) se redirigen internamente
-     * hacia el sandbox privado sin que la app lo detecte.
+     * Contexto virtual del invitado (ParallelSpace-style). El invitado ve:
+     *  - su propio package name y ApplicationInfo (patched hacia el sandbox);
+     *  - su propio classloader y Resources (AssetManager aislado);
+     *  - cada directorio escribible redirigido a /files/virtual_env/<pkg>/ del
+     *    proceso de Aegis (mismo UID -> escritura real, sin EACCES);
+     *  - SharedPreferences bajo espacio de nombres propio;
+     *  - startActivity de componentes propios reenrutado al stub por launchMode.
      */
     class VirtualGuestContext(
         base: Context,
         private val guestPackageName: String,
         private val sandboxRoot: File,
         private val guestClassLoader: ClassLoader,
-        private val guestResources: Resources? = null
-    ) : ContextWrapper(base) {
+        private val guestResources: Resources? = null,
+        private val guestAppInfo: ApplicationInfo? = null,
+        private val guestApplication: Application? = null
+    ) : android.content.ContextWrapper(base) {
 
-        private val realSandboxFilesDir = File(sandboxRoot, "files").apply { mkdirs() }
-        private val realSandboxCacheDir = File(sandboxRoot, "cache").apply { mkdirs() }
-
-        // Rutas lógicas estándar devueltas a la app huésped
-        private val standardDataDir = File("/data/user/0/$guestPackageName")
-        private val standardFilesDir = File(standardDataDir, "files")
-        private val standardCacheDir = File(standardDataDir, "cache")
+        // ---- Identidad -------------------------------------------------------
 
         override fun getPackageName(): String = guestPackageName
 
-        // Retorna la ruta estándar esperada por SDKs y comprobaciones de integridad
-        override fun getFilesDir(): File = standardFilesDir
-        override fun getCacheDir(): File = standardCacheDir
-        override fun getDataDir(): File = standardDataDir
+        override fun getApplicationInfo(): ApplicationInfo = guestAppInfo ?: super.getApplicationInfo()
 
         override fun getClassLoader(): ClassLoader = guestClassLoader
+
+        override fun getApplicationContext(): Context = guestApplication ?: super.getApplicationContext()
+
+        override fun createPackageContext(name: String, flags: Int): Context =
+            if (name == guestPackageName) this else super.createPackageContext(name, flags)
+
+        // ---- Recursos del invitado -------------------------------------------
+
+        override fun getAssets(): AssetManager = guestResources?.assets ?: super.getAssets()
         override fun getResources(): Resources = guestResources ?: super.getResources()
 
-        override fun getPackageResourcePath(): String {
-            return baseContext.packageResourcePath
+        // ---- Almacenamiento redirigido al sandbox -----------------------------
+
+        private fun dir(child: String): File = File(sandboxRoot, child).apply { mkdirs() }
+
+        override fun getFilesDir(): File = dir("files")
+        override fun getCacheDir(): File = dir("cache")
+        override fun getCodeCacheDir(): File = dir("code_cache")
+        override fun getNoBackupFilesDir(): File = dir("no_backup")
+        override fun getObbDir(): File = dir("obb")
+        override fun getDir(name: String?, mode: Int): File = dir("app_${name ?: "misc"}")
+        override fun getExternalFilesDir(type: String?): File? =
+            dir(if (type.isNullOrBlank()) "external_files" else "external_files/$type")
+        override fun getDatabasePath(name: String?): File = File(dir("databases"), name ?: "default.db")
+
+        override fun openFileInput(name: String): FileInputStream =
+            FileInputStream(File(getFilesDir(), name))
+
+        override fun openFileOutput(name: String, mode: Int): FileOutputStream =
+            FileOutputStream(File(getFilesDir(), name), (mode and Context.MODE_APPEND) != 0)
+
+        override fun deleteFile(name: String): Boolean = File(getFilesDir(), name).delete()
+
+        override fun getFileStreamPath(name: String): File = File(getFilesDir(), name)
+
+        override fun openOrCreateDatabase(
+            name: String?, mode: Int, factory: SQLiteDatabase.CursorFactory?
+        ): SQLiteDatabase = SQLiteDatabase.openOrCreateDatabase(getDatabasePath(name), factory)
+
+        override fun openOrCreateDatabase(
+            name: String?, mode: Int, factory: SQLiteDatabase.CursorFactory?,
+            errorHandler: android.database.DatabaseErrorHandler?
+        ): SQLiteDatabase = SQLiteDatabase.openOrCreateDatabase(getDatabasePath(name), factory)
+
+        override fun deleteDatabase(name: String?): Boolean = getDatabasePath(name).delete()
+
+        /** SharedPreferences del invitado, guardadas en el proceso de Aegis con namespace propio. */
+        override fun getSharedPreferences(name: String?, mode: Int): SharedPreferences =
+            super.getSharedPreferences("$guestPackageName.${name ?: "default"}", mode)
+
+        // ---- Enrutado de intents del invitado ---------------------------------
+
+        private fun routedActivityIntent(intent: Intent): Intent {
+            val stub = intent.component?.className
+                ?.let { className -> stubActivityNameFor(className) }
+                ?: "com.aistudio.aegis.virtualcore.StubProcessActivityP0"
+            return GuestIntentRouter.route(intent, guestPackageName, stub)
         }
 
-        override fun getPackageCodePath(): String {
-            return baseContext.packageCodePath
-        }
+        override fun startActivity(intent: Intent) =
+            super.startActivity(routedActivityIntent(intent))
 
-        override fun openFileInput(name: String): FileInputStream {
-            val realFile = File(realSandboxFilesDir, name)
-            return FileInputStream(realFile)
-        }
-
-        override fun openFileOutput(name: String, mode: Int): FileOutputStream {
-            val realFile = File(realSandboxFilesDir, name)
-            val append = (mode and Context.MODE_APPEND) != 0
-            return FileOutputStream(realFile, append)
-        }
-
-        override fun deleteFile(name: String): Boolean {
-            val realFile = File(realSandboxFilesDir, name)
-            return realFile.delete()
-        }
-
-        override fun getFileStreamPath(name: String): File {
-            return File(realSandboxFilesDir, name)
-        }
-
-        fun getRealSandboxDir(): File = sandboxRoot
-        fun getRealFilesDir(): File = realSandboxFilesDir
-        fun getRealCacheDir(): File = realSandboxCacheDir
+        override fun startActivity(intent: Intent, options: Bundle?) =
+            super.startActivity(routedActivityIntent(intent), options)
     }
 
+    /** Stub (por launchMode y slot de proceso) para un componente del invitado. */
+    private fun stubActivityNameFor(guestClassName: String): String = runCatching {
+        val pkg = GuestSession.packageName
+        val info = if (guestClassName.isNotBlank()) {
+            GuestRuntimeEngine.hostContextForStubs?.packageManager
+                ?.getActivityInfo(android.content.ComponentName(pkg, guestClassName), 0)
+        } else null
+        val suffix = if (GuestSession.stubProcessSuffix == ":p1") "P1" else "P0"
+        when (info?.launchMode ?: ActivityInfo.LAUNCH_MULTIPLE) {
+            ActivityInfo.LAUNCH_SINGLE_TOP -> "com.aistudio.aegis.virtualcore.StubProcessActivity${suffix}SingleTop"
+            ActivityInfo.LAUNCH_SINGLE_TASK -> "com.aistudio.aegis.virtualcore.StubProcessActivity${suffix}SingleTask"
+            ActivityInfo.LAUNCH_SINGLE_INSTANCE -> "com.aistudio.aegis.virtualcore.StubProcessActivity${suffix}SingleInstance"
+            else -> "com.aistudio.aegis.virtualcore.StubProcessActivity$suffix"
+        }
+    }.getOrDefault("com.aistudio.aegis.virtualcore.StubProcessActivityP0")
+
     /**
-     * Crea los Resources del APK huésped cargando exhaustivamente base.apk y todos los split APKs
-     * (split_config.*.apk) para evitar pantallas blancas o fallos por recursos gráficos faltantes.
+     * Construye un VirtualGuestContext sobre [base] con el estado de [GuestSession].
+     * Usado tanto para el Application del invitado como para cada activity transmutada.
+     */
+    fun buildGuestContext(base: Context): VirtualGuestContext = VirtualGuestContext(
+        base = base,
+        guestPackageName = GuestSession.packageName,
+        sandboxRoot = GuestSession.sandboxRoot ?: base.filesDir.parentFile ?: base.filesDir,
+        guestClassLoader = GuestSession.classLoader ?: base.classLoader,
+        guestResources = GuestSession.resources,
+        guestAppInfo = GuestSession.appInfo,
+        guestApplication = GuestSession.application
+    )
+
+    /** Contexto del host usado para resolver ActivityInfo de los invitados (proceso stub). */
+    @Volatile var hostContextForStubs: Context? = null
+
+    /**
+     * Crea los Resources del APK huésped cargando el framework (framework-res + overlays),
+     * base.apk y todos los split APKs. SIN el framework en el AssetManager, cualquier
+     * atributo android: del layout/tema del invitado no resuelve -> inflate crashea.
      */
     fun createGuestResources(baseContext: Context, apkFiles: List<File>): Resources? {
         if (apkFiles.isEmpty()) return null
         return try {
-            val assetManager = AssetManager::class.java.getDeclaredConstructor().newInstance()
+            HiddenApiExempt.exemptAll()
+            val assetManager = AssetManager::class.java.getDeclaredConstructor().newInstance() as AssetManager
             val addAssetPath: Method = AssetManager::class.java.getDeclaredMethod("addAssetPath", String::class.java)
             addAssetPath.isAccessible = true
-
-            // Cargar base.apk y todos los split APKs de densidad, lenguaje y configuración
+            var added = 0
+            // 1) Framework primero: RRO overlays incluidos en API 29+, fallback framework-res.apk.
+            for (frameworkPath in frameworkAssetPaths()) {
+                val cookie = addAssetPath.invoke(assetManager, frameworkPath) as Int
+                if (cookie != 0) added++
+            }
+            // 2) base.apk + split_config.*.apk del invitado.
             for (apk in apkFiles) {
                 if (apk.exists()) {
-                    addAssetPath.invoke(assetManager, apk.absolutePath)
+                    val cookie = addAssetPath.invoke(assetManager, apk.absolutePath) as Int
+                    if (cookie != 0) added++
                     Log.i(TAG, "AssetPath cargado en Resources: ${apk.name}")
                 }
             }
-
+            if (added <= apkFiles.size) {
+                Log.w(TAG, "AssetManager sin paths del framework; los temas android: pueden no resolver")
+            }
             val superRes = baseContext.resources
             Resources(assetManager, superRes.displayMetrics, superRes.configuration)
         } catch (e: Exception) {
             Log.w(TAG, "No se pudieron crear Resources combinados: ${e.message}")
             null
         }
+    }
+
+    /** Rutas de assets del framework vía reflexión (getApkAssets/getAssetPath son APIs ocultas). */
+    private fun frameworkAssetPaths(): List<String> = runCatching {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val assets = Resources.getSystem().assets
+            val apkAssets = AssetManager::class.java.getDeclaredMethod("getApkAssets")
+                .apply { isAccessible = true }
+                .invoke(assets) as Array<*>
+            apkAssets.mapNotNull { entry ->
+                runCatching {
+                    entry!!.javaClass.getDeclaredMethod("getAssetPath")
+                        .apply { isAccessible = true }
+                        .invoke(entry) as? String
+                }.getOrNull()
+            }.filterNotNull()
+        } else emptyList()
+    }.getOrNull().orEmpty().ifEmpty {
+        listOfNotNull("/system/framework/framework-res.apk".takeIf { File(it).exists() })
     }
 
     /**
@@ -160,8 +264,125 @@ object GuestRuntimeEngine {
         return files
     }
 
+    // ---- ClassLoader compartido por proceso ----------------------------------
+
+    private val loadersByPackage = HashMap<String, DexClassLoader>()
+
+    /** DexClassLoader por paquete, compartido entre telemetría y UI (mismas clases, un loader). */
+    @Synchronized
+    fun loaderFor(
+        context: Context,
+        packageName: String,
+        allApkFiles: List<File>,
+        containerDir: File,
+        nativeLibDir: File
+    ): DexClassLoader? {
+        loadersByPackage[packageName]?.let { return it }
+        val dexClassPath = if (allApkFiles.isNotEmpty()) {
+            allApkFiles.joinToString(File.pathSeparator) { it.absolutePath }
+        } else {
+            return null
+        }
+        val optimizedDexDir = File(containerDir, "oat").apply { mkdirs() }
+        return try {
+            DexClassLoader(
+                dexClassPath,
+                optimizedDexDir.absolutePath,
+                nativeLibDir.absolutePath,
+                context.classLoader
+            ).also { loadersByPackage[packageName] = it }
+        } catch (t: Throwable) {
+            Log.w(TAG, "No se pudo crear DexClassLoader de $packageName: ${t.message}")
+            null
+        }
+    }
+
+    // ---- Application del invitado (hilo principal) ----------------------------
+
+    private val hostedApplications = HashMap<String, Application>()
+
+    /**
+     * Adjunta y arranca el Application del invitado con Application.attach() — no
+     * attachBaseContext, que deja el objeto medio inicializado — y ejecuta onCreate().
+     * Debe llamarse en el HILO PRINCIPAL del proceso stub (los SDKs del invitado
+     * asumen Looper.main() durante onCreate).
+     */
+    @Synchronized
+    fun hostGuestApplication(
+        mainThreadContext: Context,
+        packageName: String,
+        guestLoader: ClassLoader,
+        virtualContext: VirtualGuestContext
+    ): Application? {
+        hostedApplications[packageName]?.let { return it }
+        return try {
+            val appClassName = try {
+                mainThreadContext.packageManager.getApplicationInfo(packageName, 0).className
+            } catch (_: Exception) { null }
+            if (appClassName.isNullOrBlank()) return null
+            val clazz = guestLoader.loadClass(appClassName)
+            if (!Application::class.java.isAssignableFrom(clazz)) return null
+            val guestApp = clazz.getDeclaredConstructor().newInstance() as Application
+            val attachMethod = Application::class.java.getDeclaredMethod("attach", Context::class.java)
+            attachMethod.isAccessible = true
+            attachMethod.invoke(guestApp, virtualContext)
+            GuestSession.application = guestApp
+            try {
+                guestApp.onCreate()
+            } catch (t: Throwable) {
+                Log.w(TAG, "guest Application.onCreate falló (no fatal): ${t.message}")
+            }
+            hostedApplications[packageName] = guestApp
+            Log.i(TAG, "Application del invitado alojado en hilo principal: $appClassName")
+            guestApp
+        } catch (t: Throwable) {
+            Log.w(TAG, "No se pudo alojar el Application de $packageName (no fatal): ${t.message}")
+            null
+        }
+    }
+
+    /** Lanza el Activity real del invitado a través del stub que corresponda a su launchMode. */
+    fun launchGuestActivityFrom(activity: Activity, guestClassName: String): Boolean {
+        val pkg = GuestSession.packageName
+        if (pkg.isBlank()) return false
+        return try {
+            val info = try {
+                activity.packageManager.getActivityInfo(android.content.ComponentName(pkg, guestClassName), 0)
+            } catch (_: Exception) { null }
+            val suffix = if (GuestSession.stubProcessSuffix == ":p1") "P1" else "P0"
+            val stubClass = when (info?.launchMode ?: ActivityInfo.LAUNCH_MULTIPLE) {
+                ActivityInfo.LAUNCH_SINGLE_TOP -> StubProcessActivityP0SingleTop::class.java
+                ActivityInfo.LAUNCH_SINGLE_TASK -> StubProcessActivityP0SingleTask::class.java
+                ActivityInfo.LAUNCH_SINGLE_INSTANCE -> StubProcessActivityP0SingleInstance::class.java
+                else -> StubProcessActivityP0::class.java
+            }.let { standard ->
+                if (suffix == "P1") {
+                    when (standard) {
+                        StubProcessActivityP0SingleTop::class.java -> StubProcessActivityP1SingleTop::class.java
+                        StubProcessActivityP0SingleTask::class.java -> StubProcessActivityP1SingleTask::class.java
+                        StubProcessActivityP0SingleInstance::class.java -> StubProcessActivityP1SingleInstance::class.java
+                        else -> StubProcessActivityP1::class.java
+                    }
+                } else standard
+            }
+            val launchIntent = Intent(activity, stubClass).apply {
+                putExtra(EXTRA_PACKAGE_NAME, pkg)
+                putExtra(EXTRA_GUEST_CLASS, guestClassName)
+                putExtra(EXTRA_LAUNCH_UI, true)
+            }
+            activity.startActivity(launchIntent)
+            Log.i(TAG, "lanzamiento del invitado por stub=${stubClass.simpleName}: $guestClassName")
+            true
+        } catch (t: Throwable) {
+            Log.w(TAG, "lanzamiento del invitado falló: ${t.message}")
+            false
+        }
+    }
+
     /**
      * Arranque del contenedor cooperativo en el proceso actual (`:p0` / `:p1`).
+     * Responsable SOLO de telemetría (mapeo de librerías + /proc/self/maps + reporte).
+     * La transmutación de UI vive en [BaseStubProcessActivity].
      */
     fun bootstrapAndInspectGuest(
         hostContext: Context,
@@ -209,62 +430,29 @@ object GuestRuntimeEngine {
             File(containerDir, "lib").apply { mkdirs() }
         }
 
-        val optimizedDexDir = File(containerDir, "oat").apply { mkdirs() }
-
         val allApkFiles = resolveAllApkFiles(hostContext, packageName, apkPath)
-        val dexClassPath = if (allApkFiles.isNotEmpty()) {
-            allApkFiles.joinToString(File.pathSeparator) { it.absolutePath }
-        } else {
-            apkPath
+        val guestLoader = loaderFor(hostContext, packageName, allApkFiles, containerDir, nativeLibDir)
+
+        // Publicar la sesión (el stub activity ya lo habrá hecho si vino por UI).
+        if (GuestSession.packageName.isBlank()) {
+            GuestSession.packageName = packageName
+            GuestSession.classLoader = guestLoader
+            GuestSession.sandboxRoot = containerDir
+            GuestSession.nativeLibDir = nativeLibDir
+            GuestSession.stubProcessSuffix = processName
         }
 
-        // 1. Inicializar ClassLoader y Contexto cooperativo
-        if (dexClassPath.isNotBlank()) {
-            try {
-                val guestLoader = DexClassLoader(
-                    dexClassPath,
-                    optimizedDexDir.absolutePath,
-                    nativeLibDir.absolutePath,
-                    hostContext.classLoader
-                )
-                val guestRes = createGuestResources(hostContext, allApkFiles)
-                val virtualContext = VirtualGuestContext(
-                    base = hostContext.applicationContext,
-                    guestPackageName = packageName,
-                    sandboxRoot = containerDir,
-                    guestClassLoader = guestLoader,
-                    guestResources = guestRes
-                )
-                Log.i(
-                    TAG,
-                    "Contexto VFS transparente configurado para $packageName (APKs=${allApkFiles.size})"
-                )
-
-                try {
-                    val appInfo = hostContext.packageManager.getApplicationInfo(packageName, 0)
-                    val appClassName = appInfo.className
-                    if (!appClassName.isNullOrBlank()) {
-                        val clazz = guestLoader.loadClass(appClassName)
-                        if (Application::class.java.isAssignableFrom(clazz)) {
-                            val guestApp = clazz.getDeclaredConstructor().newInstance() as Application
-                            val attachMethod = ContextWrapper::class.java.getDeclaredMethod(
-                                "attachBaseContext",
-                                Context::class.java
-                            )
-                            attachMethod.isAccessible = true
-                            attachMethod.invoke(guestApp, virtualContext)
-                            Log.i(TAG, "Application.attachBaseContext ejecutado cooperativamente: $appClassName")
-                        }
-                    }
-                } catch (t: Throwable) {
-                    Log.w(TAG, "Aviso al adjuntar Application de $packageName: ${t.message}")
-                }
-            } catch (t: Throwable) {
-                Log.w(TAG, "Aviso al crear DexClassLoader de $packageName: ${t.message}")
-            }
+        // Telemetría: el Application del invitado se aloja SOLO desde el stub activity
+        // (hilo principal). Aquí correr en Thread{} rompería SDKs que exigen Looper.main().
+        if (guestLoader != null && Looper.myLooper() == Looper.getMainLooper()) {
+            val guestRes = createGuestResources(hostContext, allApkFiles)
+            if (GuestSession.resources == null) GuestSession.resources = guestRes
+            hostGuestApplication(
+                hostContext, packageName, guestLoader, buildGuestContext(hostContext.applicationContext)
+            )
         }
 
-        // 2. Ejecutar inspección cooperativa de librerías y /proc/self/maps
+        // Inspección cooperativa de librerías y /proc/self/maps
         val report = NativeGuestBridge.inspectCurrentProcessMaps(
             packageName = packageName,
             processName = processName,
@@ -273,7 +461,7 @@ object GuestRuntimeEngine {
             forceErrorReason = null
         )
 
-        // 3. Transmisión del reporte al host
+        // Transmisión del reporte al host
         val sent = AegisReportProvider.sendReportToHost(hostContext, report)
         Log.i(TAG, "Reporte cooperativo transmitido al Host desde $processName (ack=$sent, libs=${report.libs.size})")
         return report
@@ -291,6 +479,7 @@ open class BaseStubProcessService(private val stubSuffix: String) : Service() {
             val safeIntent = Intent(intent).apply {
                 putExtra(GuestRuntimeEngine.EXTRA_PROCESS_NAME, stubSuffix)
             }
+            GuestSession.stubProcessSuffix = stubSuffix
             Thread {
                 try {
                     GuestRuntimeEngine.bootstrapAndInspectGuest(applicationContext, safeIntent)
@@ -311,17 +500,19 @@ class StubProcessServiceP0 : BaseStubProcessService(":p0")
 class StubProcessServiceP1 : BaseStubProcessService(":p1")
 
 /**
- * Virtual Activity Launcher (StubActivity) con Sandbox de Aislamiento de Fallos:
+ * Virtual Activity Launcher (StubActivity) con transmutación REAL del invitado.
  *
- * Mejoras aplicadas:
- * 1. Crash Handler integral (UncaughtExceptionHandler + Signal Handler nativo):
- *    Cualquier excepción no capturada de la app clonada notifica al proceso host vía IPC,
- *    cierra la Activity y mata SOLO su proceso stub (:p0 o :p1) con Process.killProcess().
- *    Aegis Engine NUNCA se cierra.
- * 2. VFS Transparente:
- *    Provee a la app invitada rutas coherentes (/data/user/0/<pkg>/...) redirigiendo E/S a su sandbox.
- * 3. Resolución Completa de Recursos:
- *    Carga base.apk y todos los split APKs de configuración, densidad e idioma mediante addAssetPath.
+ * Flujo corregido (v1.1):
+ *  1. Sandbox de fallos + crash handler nativo;
+ *  2. Estado de sesión (paquete, classloader, recursos) publicado en [GuestSession];
+ *  3. [AegisInstrumentation] instalada en el ActivityThread del proceso stub;
+ *  4. Application del invitado alojado en el hilo principal;
+ *  5. startActivity del LAUNCHER real del invitado -> el framework crea la instancia
+ *     del invitado vía nuestra Instrumentation, transmuta mBase y ejecuta su onCreate
+ *     con su propio tema y recursos. FIN de la pantalla blanca.
+ *
+ * Si la transmutación no está disponible, se muestra el workspace de respaldo
+ * (nunca un proceso muerto ni una pantalla en blanco).
  */
 open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() {
 
@@ -329,16 +520,10 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
         private const val TAG = "AegisStubActivity"
     }
 
-    private var guestActivityInstance: Activity? = null
-    private var guestResources: Resources? = null
     private var isTerminatingCleanly = false
 
-    override fun getResources(): Resources {
-        return guestResources ?: super.getResources()
-    }
-
     override fun onCreate(savedInstanceState: Bundle?) {
-        // Instalación del Sandbox de Errores Java/Kotlin en el proceso stub
+        // Sandbox de errores Java/Kotlin del proceso stub
         installStubCrashSandbox()
 
         super.onCreate(savedInstanceState)
@@ -353,13 +538,16 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
         val apkPath = intentData.getStringExtra(GuestRuntimeEngine.EXTRA_APK_PATH) ?: ""
         val containerDirPath = intentData.getStringExtra(GuestRuntimeEngine.EXTRA_CONTAINER_DIR) ?: ""
         val nativeLibDirPath = intentData.getStringExtra(GuestRuntimeEngine.EXTRA_NATIVE_LIB_DIR) ?: ""
+        val launchUi = intentData.getBooleanExtra(GuestRuntimeEngine.EXTRA_LAUNCH_UI, true)
 
-        // Instalar también crash handler nativo (SIGSEGV, SIGABRT)
+        // Crash handler nativo (SIGSEGV, SIGABRT) del invitado
         try {
             NativeGuestBridge.ensureLoaded()
             NativeGuestBridge.nativeInstallCrashHandler()
         } catch (_: Exception) {}
 
+        // Pantalla de carga/respaldo: visible mientras el invitado transmuta
+        // (o para siempre si la transmutación no está disponible).
         val rootContainer = FrameLayout(this).apply {
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -369,7 +557,77 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
         }
         setContentView(rootContainer)
 
-        // Telemetría asíncrona
+        // Preparación del entorno del invitado en el HILO PRINCIPAL: los SDKs del
+        // huesped asumen Looper.main() durante Application.onCreate.
+        val containerDir = if (containerDirPath.isNotBlank()) File(containerDirPath)
+            else File(filesDir, "virtual_env/$packageName").apply { mkdirs() }
+        val nativeLibDir = if (nativeLibDirPath.isNotBlank()) File(nativeLibDirPath)
+            else File(containerDir, "lib").apply { mkdirs() }
+        containerDir.mkdirs(); nativeLibDir.mkdirs()
+
+        var transmutationReady = false
+        try {
+            HiddenApiExempt.exemptAll()
+
+            val allApkFiles = GuestRuntimeEngine.resolveAllApkFiles(this, packageName, apkPath)
+            val guestLoader = GuestRuntimeEngine.loaderFor(this, packageName, allApkFiles, containerDir, nativeLibDir)
+            if (guestLoader != null) {
+                val guestRes = GuestRuntimeEngine.createGuestResources(this, allApkFiles)
+
+                // ApplicationInfo patcheado hacia el sandbox (dataDir/lib accesibles).
+                val patchedAppInfo = try {
+                    ApplicationInfo(packageManager.getApplicationInfo(packageName, 0)).apply {
+                        dataDir = containerDir.absolutePath
+                        deviceProtectedDataDir = File(containerDir, "device_protected").absolutePath
+                        nativeLibraryDir = nativeLibDir.absolutePath
+                        processName = packageName
+                    }
+                } catch (_: Exception) { null }
+
+                // Publicar la sesión ANTES de instalar la Instrumentation.
+                GuestSession.packageName = packageName
+                GuestSession.hostPackage = applicationContext.packageName
+                GuestSession.stubProcessSuffix = stubSuffix
+                GuestSession.classLoader = guestLoader
+                GuestSession.resources = guestRes
+                GuestSession.sandboxRoot = containerDir
+                GuestSession.nativeLibDir = nativeLibDir
+                GuestSession.appInfo = patchedAppInfo
+                GuestRuntimeEngine.hostContextForStubs = applicationContext
+
+                // Application del invitado (attach + onCreate) en el hilo principal.
+                val guestApp = GuestRuntimeEngine.hostGuestApplication(
+                    applicationContext, packageName, guestLoader,
+                    GuestRuntimeEngine.buildGuestContext(applicationContext)
+                )
+                if (guestApp != null) {
+                    Log.i(TAG, "Application del invitado listo (hilo principal): $packageName")
+                }
+
+                // Hooks de transmutación: los stubs pasan a ser actividades reales del invitado.
+                val hooksOk = ActivityThreadHook.installIfNeeded()
+                Log.i(TAG, "Instrumentation transmutadora ${if (hooksOk) "instalada" else "NO disponible"} en $stubSuffix")
+
+                if (launchUi && hooksOk) {
+                    val guestClassName = intentData.getStringExtra(GuestRuntimeEngine.EXTRA_GUEST_CLASS)
+                        ?: findLaunchActivityClassName(packageName)
+                    if (!guestClassName.isNullOrBlank() &&
+                        GuestRuntimeEngine.launchGuestActivityFrom(this, guestClassName)
+                    ) {
+                        transmutationReady = true
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "Transmutación del invitado diferida: ${t.message}")
+        }
+
+        if (!transmutationReady) {
+            // Respaldo honesto: workspace aislado + telemetría, sin fingir UI del invitado.
+            showFullscreenProcessWorkspace(rootContainer, packageName)
+        }
+
+        // Telemetría asíncrona (mapeo .so + /proc/self/maps + reporte al host)
         Thread {
             try {
                 GuestRuntimeEngine.bootstrapAndInspectGuest(applicationContext, intentData)
@@ -377,88 +635,13 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
                 Log.w(TAG, "Telemetría en stub activity aislada: ${t.message}")
             }
         }.start()
-
-        val allApkFiles = GuestRuntimeEngine.resolveAllApkFiles(this, packageName, apkPath)
-        val dexClassPath = if (allApkFiles.isNotEmpty()) {
-            allApkFiles.joinToString(File.pathSeparator) { it.absolutePath }
-        } else {
-            apkPath
-        }
-
-        if (dexClassPath.isNotBlank()) {
-            val containerDir = File(containerDirPath)
-            val nativeLibDir = File(nativeLibDirPath)
-            val optimizedDexDir = File(containerDir, "oat").apply { mkdirs() }
-
-            try {
-                val guestLoader = DexClassLoader(
-                    dexClassPath,
-                    optimizedDexDir.absolutePath,
-                    nativeLibDir.absolutePath,
-                    classLoader
-                )
-
-                // Cargar base y split APKs para evitar pantallas blancas
-                val res = GuestRuntimeEngine.createGuestResources(this, allApkFiles)
-                if (res != null) {
-                    guestResources = res
-                }
-
-                val virtualContext = GuestRuntimeEngine.VirtualGuestContext(
-                    base = this,
-                    guestPackageName = packageName,
-                    sandboxRoot = containerDir,
-                    guestClassLoader = guestLoader,
-                    guestResources = res
-                )
-
-                val launchActivityName = findLaunchActivityClassName(packageName)
-                if (!launchActivityName.isNullOrBlank()) {
-                    val actClass = guestLoader.loadClass(launchActivityName)
-                    if (Activity::class.java.isAssignableFrom(actClass)) {
-                        val guestAct = actClass.getDeclaredConstructor().newInstance() as Activity
-                        guestActivityInstance = guestAct
-
-                        val attachMethod = Activity::class.java.getDeclaredMethod(
-                            "attach",
-                            Context::class.java,
-                            Class.forName("android.app.ActivityThread"),
-                            Class.forName("android.app.Instrumentation"),
-                            IBinder::class.java,
-                            Int::class.javaPrimitiveType,
-                            Application::class.java,
-                            Intent::class.java,
-                            ActivityInfo::class.java,
-                            CharSequence::class.java,
-                            Activity::class.java,
-                            String::class.java,
-                            Class.forName("android.app.Activity\$NonConfigurationInstances"),
-                            Configuration::class.java,
-                            String::class.java,
-                            Class.forName("com.android.internal.app.IVoiceInteractor"),
-                            android.view.Window::class.java,
-                            Class.forName("android.view.ViewRootImpl\$ActivityConfigCallback"),
-                            IBinder::class.java
-                        )
-                        // Invocación condicional de attach si la firma coincide
-                    }
-                }
-            } catch (t: Throwable) {
-                Log.w(TAG, "Lanzamiento visual directo del APK huésped diferido: ${t.message}")
-            }
-        }
-
-        // Renderizado del espacio de ejecución en pantalla completa
-        showFullscreenProcessWorkspace(rootContainer, packageName)
     }
 
     /**
-     * Captura y aísla fallos de ejecución de la app clonada:
-     * Si la app clonada crashea en runtime, notifica al Host, finaliza esta Activity y
-     * termina exclusivamente el proceso stub (:p0/:p1) sin afectar el proceso de Aegis.
+     * Captura y aísla fallos de ejecución de la app clonada: notifica al host,
+     * finaliza esta Activity y termina SOLO el proceso stub (:p0/:p1). Aegis nunca se cierra.
      */
     private fun installStubCrashSandbox() {
-        val originalHandler = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
             val pkg = intent?.getStringExtra(GuestRuntimeEngine.EXTRA_PACKAGE_NAME) ?: "App clonada"
             val errorMsg = "La app se cerró inesperadamente (${throwable.javaClass.simpleName}: ${throwable.message})"
@@ -500,11 +683,10 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT
             )
-            setBackgroundColor(0xFF0F172A.toInt())
         }
 
-        val centerBox = android.widget.LinearLayout(this).apply {
-            orientation = android.widget.LinearLayout.VERTICAL
+        val centerBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
@@ -525,15 +707,16 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
 
         val subView = TextView(this).apply {
             text = "Ejecutándose en pantalla completa en proceso $stubSuffix (PID: ${Process.myPid()})\n" +
-                "VFS transparente activo (/data/user/0/$packageName/)\n" +
-                "Aislamiento de fallos y librerías .so mapeadas"
+                "Sandbox VFS: /files/virtual_env/$packageName/\n" +
+                "Transmutación de UI no disponible para este invitado; " +
+                "las librerías .so siguen mapeándose e informando al host."
             textSize = 14f
             setTextColor(0xFF94A3B8.toInt())
             gravity = Gravity.CENTER
             setPadding(0, 20, 0, 40)
         }
 
-        val btnClose = android.widget.Button(this).apply {
+        val btnClose = Button(this).apply {
             text = "Cerrar Contenedor Virtual"
             setBackgroundColor(0xFF2563EB.toInt())
             setTextColor(0xFFFFFFFF.toInt())
@@ -541,9 +724,9 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
                 isTerminatingCleanly = true
                 finish()
             }
-            layoutParams = android.widget.LinearLayout.LayoutParams(
-                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT,
-                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply {
                 gravity = Gravity.CENTER_HORIZONTAL
             }
@@ -560,9 +743,14 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
 
     override fun onDestroy() {
         super.onDestroy()
-        guestActivityInstance = null
     }
 }
 
 class StubProcessActivityP0 : BaseStubProcessActivity(":p0")
 class StubProcessActivityP1 : BaseStubProcessActivity(":p1")
+class StubProcessActivityP0SingleTop : BaseStubProcessActivity(":p0")
+class StubProcessActivityP0SingleTask : BaseStubProcessActivity(":p0")
+class StubProcessActivityP0SingleInstance : BaseStubProcessActivity(":p0")
+class StubProcessActivityP1SingleTop : BaseStubProcessActivity(":p1")
+class StubProcessActivityP1SingleTask : BaseStubProcessActivity(":p1")
+class StubProcessActivityP1SingleInstance : BaseStubProcessActivity(":p1")
