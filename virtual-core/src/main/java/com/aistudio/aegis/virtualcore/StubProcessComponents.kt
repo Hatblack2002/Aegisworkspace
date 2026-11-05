@@ -8,6 +8,7 @@ import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.ActivityInfo
 import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
 import android.content.res.AssetManager
 import android.content.res.Resources
 import android.database.sqlite.SQLiteDatabase
@@ -18,6 +19,7 @@ import android.os.Looper
 import android.os.Process
 import android.util.Log
 import android.view.Gravity
+import android.view.LayoutInflater
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.FrameLayout
@@ -95,6 +97,59 @@ object GuestRuntimeEngine {
         override fun getAssets(): AssetManager = guestResources?.assets ?: super.getAssets()
         override fun getResources(): Resources = guestResources ?: super.getResources()
 
+        // ---- Tema del invitado (construido sobre SU Resources) ----------------
+
+        private var guestTheme: Resources.Theme? = null
+        private var guestThemeResId: Int = 0
+
+        override fun setTheme(resid: Int) {
+            guestThemeResId = resid
+        }
+
+        override fun getTheme(): Resources.Theme {
+            val existing = guestTheme
+            if (existing != null) return existing
+            val theme = (guestResources ?: super.getResources()).newTheme()
+            // Base del framework: los IDs android.* resuelven porque framework-res está
+            // dentro del AssetManager del invitado.
+            runCatching { theme.applyStyle(android.R.style.Theme_DeviceDefault, false) }
+            val appTheme = guestAppInfo?.theme ?: 0
+            if (appTheme != 0) runCatching { theme.applyStyle(appTheme, true) }
+            if (guestThemeResId != 0) runCatching { theme.applyStyle(guestThemeResId, true) }
+            guestTheme = theme
+            return theme
+        }
+
+        // ---- LayoutInflater del invitado ---------------------------------------
+        // CRÍTICO (pantalla blanca): sin este override, LayoutInflater.from(contexto)
+        // devuelve el inflater del ContextImpl del HOST, que resuelve los IDs 0x7f del
+        // invitado contra recursos del host -> NotFoundException al primer setContentView.
+        // cloneInContext conserva las factories y redirige getResources() a ESTE contexto.
+
+        override fun getSystemService(name: String): Any? {
+            if (Context.LAYOUT_INFLATER_SERVICE == name) {
+                val baseInflater = super.getSystemService(name) as? LayoutInflater ?: return null
+                return baseInflater.cloneInContext(this)
+            }
+            return super.getSystemService(name)
+        }
+
+        // ---- PackageManager del invitado ---------------------------------------
+        // El dataDir/nativeLibraryDir REALES apuntan a otro UID (EACCES). El proxy
+        // redirige esas rutas al sandbox y ruthea el launch intent del propio invitado
+        // hacia los stubs correspondientes.
+
+        private val guestPackageManager: PackageManager by lazy {
+            GuestPackageManager(
+                guestPackageName = guestPackageName,
+                sandboxRoot = sandboxRoot,
+                guestAppInfo = guestAppInfo,
+                base = super.getPackageManager()
+            )
+        }
+
+        override fun getPackageManager(): PackageManager = guestPackageManager
+
         // ---- Almacenamiento redirigido al sandbox -----------------------------
 
         private fun dir(child: String): File = File(sandboxRoot, child).apply { mkdirs() }
@@ -151,7 +206,7 @@ object GuestRuntimeEngine {
     }
 
     /** Stub (por launchMode y slot de proceso) para un componente del invitado. */
-    private fun stubActivityNameFor(guestClassName: String): String = runCatching {
+    internal fun stubActivityNameFor(guestClassName: String): String = runCatching {
         val pkg = GuestSession.packageName
         val info = if (guestClassName.isNotBlank()) {
             GuestRuntimeEngine.hostContextForStubs?.packageManager
@@ -311,31 +366,43 @@ object GuestRuntimeEngine {
     fun hostGuestApplication(
         mainThreadContext: Context,
         packageName: String,
-        guestLoader: ClassLoader,
-        virtualContext: VirtualGuestContext
+        guestLoader: ClassLoader
     ): Application? {
         hostedApplications[packageName]?.let { return it }
         return try {
             val appClassName = try {
                 mainThreadContext.packageManager.getApplicationInfo(packageName, 0).className
             } catch (_: Exception) { null }
-            if (appClassName.isNullOrBlank()) return null
-            val clazz = guestLoader.loadClass(appClassName)
-            if (!Application::class.java.isAssignableFrom(clazz)) return null
+            val clazz: Class<*> = if (!appClassName.isNullOrBlank() && runCatching {
+                    Application::class.java.isAssignableFrom(guestLoader.loadClass(appClassName))
+                }.getOrDefault(false)
+            ) {
+                guestLoader.loadClass(appClassName)
+            } else {
+                // Sin Application declarado: instancia genérica del loader del invitado
+                // para que getApplication() nunca devuelva el Application de Aegis.
+                Application::class.java
+            }
             val guestApp = clazz.getDeclaredConstructor().newInstance() as Application
+
+            // Publicar ANTES de construir el contexto de attach: así getApplicationContext()
+            // del invitado devuelve SU Application y no el de Aegis (casteos rotos en SDKs).
+            GuestSession.application = guestApp
+            val attachContext = buildGuestContext(mainThreadContext.applicationContext)
             val attachMethod = Application::class.java.getDeclaredMethod("attach", Context::class.java)
             attachMethod.isAccessible = true
-            attachMethod.invoke(guestApp, virtualContext)
-            GuestSession.application = guestApp
+            attachMethod.invoke(guestApp, attachContext)
             try {
                 guestApp.onCreate()
             } catch (t: Throwable) {
+                GuestSession.lastError = "guest Application.onCreate: ${t.message}"
                 Log.w(TAG, "guest Application.onCreate falló (no fatal): ${t.message}")
             }
             hostedApplications[packageName] = guestApp
-            Log.i(TAG, "Application del invitado alojado en hilo principal: $appClassName")
+            Log.i(TAG, "Application del invitado alojado en hilo principal: ${clazz.name}")
             guestApp
         } catch (t: Throwable) {
+            GuestSession.lastError = "hostGuestApplication($packageName): ${t.message}"
             Log.w(TAG, "No se pudo alojar el Application de $packageName (no fatal): ${t.message}")
             null
         }
@@ -447,9 +514,7 @@ object GuestRuntimeEngine {
         if (guestLoader != null && Looper.myLooper() == Looper.getMainLooper()) {
             val guestRes = createGuestResources(hostContext, allApkFiles)
             if (GuestSession.resources == null) GuestSession.resources = guestRes
-            hostGuestApplication(
-                hostContext, packageName, guestLoader, buildGuestContext(hostContext.applicationContext)
-            )
+            hostGuestApplication(hostContext, packageName, guestLoader)
         }
 
         // Inspección cooperativa de librerías y /proc/self/maps
@@ -566,13 +631,19 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
         containerDir.mkdirs(); nativeLibDir.mkdirs()
 
         var transmutationReady = false
+        val diagnostics = mutableListOf<String>()
         try {
             HiddenApiExempt.exemptAll()
 
             val allApkFiles = GuestRuntimeEngine.resolveAllApkFiles(this, packageName, apkPath)
+            diagnostics += "APKs huésped: ${allApkFiles.size}"
             val guestLoader = GuestRuntimeEngine.loaderFor(this, packageName, allApkFiles, containerDir, nativeLibDir)
-            if (guestLoader != null) {
+            if (guestLoader == null) {
+                diagnostics += "Classloader: FALLO (DexClassLoader no creado)"
+            } else {
+                diagnostics += "Classloader: OK"
                 val guestRes = GuestRuntimeEngine.createGuestResources(this, allApkFiles)
+                if (guestRes == null) diagnostics += "Recursos invitado: FALLO (AssetManager)"
 
                 // ApplicationInfo patcheado hacia el sandbox (dataDir/lib accesibles).
                 val patchedAppInfo = try {
@@ -597,34 +668,48 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
 
                 // Application del invitado (attach + onCreate) en el hilo principal.
                 val guestApp = GuestRuntimeEngine.hostGuestApplication(
-                    applicationContext, packageName, guestLoader,
-                    GuestRuntimeEngine.buildGuestContext(applicationContext)
+                    applicationContext, packageName, guestLoader
                 )
-                if (guestApp != null) {
-                    Log.i(TAG, "Application del invitado listo (hilo principal): $packageName")
-                }
+                diagnostics += "Application invitado: ${if (guestApp != null) "OK" else "genérico/falló"}"
 
                 // Hooks de transmutación: los stubs pasan a ser actividades reales del invitado.
                 val hooksOk = ActivityThreadHook.installIfNeeded()
+                diagnostics += "Instrumentation: ${if (hooksOk) "instalada" else "NO DISPONIBLE (API oculta bloqueada)"}"
                 Log.i(TAG, "Instrumentation transmutadora ${if (hooksOk) "instalada" else "NO disponible"} en $stubSuffix")
 
                 if (launchUi && hooksOk) {
                     val guestClassName = intentData.getStringExtra(GuestRuntimeEngine.EXTRA_GUEST_CLASS)
                         ?: findLaunchActivityClassName(packageName)
-                    if (!guestClassName.isNullOrBlank() &&
-                        GuestRuntimeEngine.launchGuestActivityFrom(this, guestClassName)
-                    ) {
-                        transmutationReady = true
+                    if (guestClassName.isNullOrBlank()) {
+                        diagnostics += "Lanzador del invitado: NO ENCONTRADO"
+                    } else {
+                        diagnostics += "Lanzador: $guestClassName"
+                        if (GuestRuntimeEngine.launchGuestActivityFrom(this, guestClassName)) {
+                            transmutationReady = true
+                        } else {
+                            diagnostics += "startActivity del invitado: FALLO"
+                        }
                     }
                 }
             }
         } catch (t: Throwable) {
+            diagnostics += "Excepción: ${t.javaClass.simpleName}: ${t.message}"
             Log.w(TAG, "Transmutación del invitado diferida: ${t.message}")
         }
 
-        if (!transmutationReady) {
-            // Respaldo honesto: workspace aislado + telemetría, sin fingir UI del invitado.
-            showFullscreenProcessWorkspace(rootContainer, packageName)
+        if (transmutationReady) {
+            // El stub lanzador ya cumplió su función (publicar sesión + instalar la
+            // Instrumentation); se retira para que "atrás" devuelva a Aegis y no a
+            // la pantalla de carga. El proceso sigue vivo: hospeda al invitado.
+            window?.decorView?.postDelayed({
+                if (!isFinishing) finish()
+            }, 1200)
+        } else {
+            // Respaldo honesto: workspace aislado + telemetría + MOTIVO exacto del fallo.
+            if (GuestSession.lastError.isNotBlank()) {
+                diagnostics += "Error: ${GuestSession.lastError}"
+            }
+            showFullscreenProcessWorkspace(rootContainer, packageName, diagnostics)
         }
 
         // Telemetría asíncrona (mapeo .so + /proc/self/maps + reporte al host)
@@ -670,7 +755,11 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
         }
     }
 
-    private fun showFullscreenProcessWorkspace(container: FrameLayout, packageName: String) {
+    private fun showFullscreenProcessWorkspace(
+        container: FrameLayout,
+        packageName: String,
+        diagnostics: List<String> = emptyList()
+    ) {
         val appLabel = try {
             val ai = packageManager.getApplicationInfo(packageName, 0)
             packageManager.getApplicationLabel(ai).toString()
@@ -705,12 +794,15 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
             setTypeface(null, android.graphics.Typeface.BOLD)
         }
 
+        val diagText = if (diagnostics.isEmpty()) "" else
+            "\n\nDiagnóstico de transmutación:\n" + diagnostics.joinToString("\n") { "• $it" }
+
         val subView = TextView(this).apply {
             text = "Ejecutándose en pantalla completa en proceso $stubSuffix (PID: ${Process.myPid()})\n" +
                 "Sandbox VFS: /files/virtual_env/$packageName/\n" +
                 "Transmutación de UI no disponible para este invitado; " +
-                "las librerías .so siguen mapeándose e informando al host."
-            textSize = 14f
+                "las librerías .so siguen mapeándose e informando al host." + diagText
+            textSize = 12f
             setTextColor(0xFF94A3B8.toInt())
             gravity = Gravity.CENTER
             setPadding(0, 20, 0, 40)
@@ -754,3 +846,54 @@ class StubProcessActivityP0SingleInstance : BaseStubProcessActivity(":p0")
 class StubProcessActivityP1SingleTop : BaseStubProcessActivity(":p1")
 class StubProcessActivityP1SingleTask : BaseStubProcessActivity(":p1")
 class StubProcessActivityP1SingleInstance : BaseStubProcessActivity(":p1")
+
+/**
+ * Proxy de PackageManager para el invitado: delega TODO en el PackageManager real
+ * (el invitado ES una app instalada, así que firmas/activities/permisos son correctos)
+ * y solo parchea lo que apunta a OTRO UID:
+ *  - getApplicationInfo(guest): dataDir / deviceProtectedDataDir / nativeLibraryDir
+ *    re-direccionados al sandbox (el real daría EACCES al primer File()).
+ *  - getLaunchIntentForPackage(guest): re-enrutado a los stubs del launchMode correcto.
+ */
+private class GuestPackageManager(
+    private val guestPackageName: String,
+    private val sandboxRoot: File,
+    private val guestAppInfo: ApplicationInfo?,
+    private val base: PackageManager
+) : PackageManager() by base {
+
+    private fun patched(info: ApplicationInfo): ApplicationInfo = ApplicationInfo(info).apply {
+        dataDir = sandboxRoot.absolutePath
+        deviceProtectedDataDir = File(sandboxRoot, "device_protected").absolutePath
+        nativeLibraryDir = File(sandboxRoot, "lib").absolutePath
+        processName = guestPackageName
+    }
+
+    override fun getApplicationInfo(packageName: String, flags: Int): ApplicationInfo {
+        val info = base.getApplicationInfo(packageName, flags)
+        return if (packageName == guestPackageName) patched(info) else info
+    }
+
+    override fun getApplicationInfo(
+        packageName: String,
+        flags: PackageManager.ApplicationInfoFlags
+    ): ApplicationInfo {
+        val info = base.getApplicationInfo(packageName, flags)
+        return if (packageName == guestPackageName) patched(info) else info
+    }
+
+    override fun getLaunchIntentForPackage(packageName: String): Intent? {
+        if (packageName != guestPackageName) return base.getLaunchIntentForPackage(packageName)
+        val launch = base.getLaunchIntentForPackage(packageName) ?: return null
+        val className = launch.component?.className ?: return launch
+        return Intent(launch).apply {
+            component = android.content.ComponentName(
+                GuestSession.hostPackage.ifBlank { guestPackageName },
+                GuestRuntimeEngine.stubActivityNameFor(className)
+            )
+            putExtra(GuestRuntimeEngine.EXTRA_GUEST_CLASS, className)
+            putExtra(GuestRuntimeEngine.EXTRA_PACKAGE_NAME, guestPackageName)
+        }
+    }
+}
+

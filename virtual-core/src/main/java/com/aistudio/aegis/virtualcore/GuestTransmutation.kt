@@ -67,6 +67,13 @@ object GuestActivityTransmuter {
             }
         }
 
+        // 1b. Invalidar caches de ContextThemeWrapper (mTheme/mResources/mInflater).
+        // ContextThemeWrapper —superclase de Activity— cachea estos campos LA PRIMERA VEZ
+        // que se consultan y quedan anclados a los recursos del HOST (recursos del stub).
+        // Con ellos cacheados, inflate de layouts/temas del invitado resuelve IDs 0x7f
+        // contra los recursos equivocados -> NotFoundException -> pantalla blanca/crash.
+        clearThemedContextCaches(activity)
+
         // 2. getApplication() debe devolver el Application del invitado.
         GuestSession.application?.let { app ->
             runCatching { activityField("mApplication").set(activity, app) }
@@ -87,6 +94,29 @@ object GuestActivityTransmuter {
         }
         Log.i(TAG, "actividad invitado preparada: $guestClassName")
     }
+
+    /**
+     * ContextThemeWrapper cachea mResources / mTheme / mInflater de forma lazy sobre el
+     * ContextImpl ORIGINAL (host). Se invalidan para que se re-creen sobre el nuevo mBase
+     * (VirtualGuestContext -> recursos del invitado). Cada campo es best-effort: si el
+     * nombre cambia entre versiones de Android, simplemente se omite.
+     */
+    private fun clearThemedContextCaches(activity: Activity) {
+        var clazz: Class<*>? = activity.javaClass
+        while (clazz != null && clazz != Any::class.java) {
+            if (clazz.name == "android.view.ContextThemeWrapper") {
+                for (fieldName in CACHEABLE_FIELDS) {
+                    runCatching {
+                        clazz.getDeclaredField(fieldName).apply { isAccessible = true }.set(activity, null)
+                    }
+                }
+                return
+            }
+            clazz = clazz.superclass
+        }
+    }
+
+    private val CACHEABLE_FIELDS = arrayOf("mTheme", "mResources", "mInflater")
 
     private fun activityField(name: String): Field =
         Activity::class.java.getDeclaredField(name).apply { isAccessible = true }
@@ -119,6 +149,9 @@ object GuestSession {
     @Volatile var sandboxRoot: File? = null
     @Volatile var nativeLibDir: File? = null
     @Volatile var appInfo: android.content.pm.ApplicationInfo? = null
+
+    /** Último error de transmutación (diagnóstico visible en la pantalla de respaldo). */
+    @Volatile var lastError: String = ""
 }
 
 /** Instrumentation transmutadora instalada en el ActivityThread del proceso stub. */
@@ -134,6 +167,7 @@ class AegisInstrumentation : Instrumentation() {
                 Log.i("AegisInstrumentation", "STUB transmutado -> $guestClass")
                 return real
             }.onFailure {
+                GuestSession.lastError = "loadClass($guestClass): ${it.javaClass.simpleName}: ${it.message}"
                 Log.w("AegisInstrumentation", "transmutación falló (${it.javaClass.simpleName}: ${it.message}); se mantiene el stub")
             }
         }
