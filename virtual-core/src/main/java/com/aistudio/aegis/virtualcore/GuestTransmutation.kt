@@ -283,8 +283,13 @@ class AegisInstrumentation : Instrumentation() {
      * llega al AMS con el componente del guest -> "not exported from uid" (crash de
      * MyFiles, informe p3530). Toda salida del guest se reescribe a un stub del host
      * llevando el componente real en extras — genérico, sin código por paquete.
+     *
+     * execStartActivity es API OCULTA (no está en el android.jar del SDK): no se puede
+     * "override" con Kotlin. Se declara un MÉTODO SOMBRA con el mismo nombre y
+     * descriptor que el del runtime — ART lo resuelve como reemplazo virtual en la
+     * vtable de esta subclase. El super se invoca por reflexión (exemptions OK).
      */
-    override fun execStartActivity(
+    fun execStartActivity(
         who: Context?,
         contextThread: android.os.IBinder?,
         token: android.os.IBinder?,
@@ -296,14 +301,48 @@ class AegisInstrumentation : Instrumentation() {
         val guestPkg = GuestSession.packageName
         val comp = intent?.component
         if (intent != null && guestPkg.isNotBlank() && comp?.packageName == guestPkg) {
-            val stub = comp.className?.let { stubActivityNameFor(it) }
+            val stub = comp.className?.let { GuestRuntimeEngine.stubActivityNameFor(it) }
                 ?: "com.aistudio.aegis.virtualcore.StubProcessActivityP0"
             intent.component = ComponentName(GuestSession.hostPackage.ifBlank { guestPkg }, stub)
             intent.putExtra(GuestRuntimeEngine.EXTRA_GUEST_CLASS, comp.className)
             intent.putExtra(GuestRuntimeEngine.EXTRA_PACKAGE_NAME, guestPkg)
             AegisLog.i("execStartActivity enrutado: ${comp.className} -> $stub")
         }
-        return super.execStartActivity(who, contextThread, token, target, intent, requestCode, options)
+        return runCatching {
+            superExecStartActivity(who, contextThread, token, target, intent, requestCode, options)
+        }.getOrElse {
+            AegisLog.e("execStartActivity (super) falló: ${GuestLaunchTracker.describeThrowable(it)}")
+            null
+        }
+    }
+
+    private val superExecMethod by lazy {
+        runCatching {
+            Instrumentation::class.java.getDeclaredMethod(
+                "execStartActivity",
+                Context::class.java,
+                android.os.IBinder::class.java,
+                android.os.IBinder::class.java,
+                Activity::class.java,
+                Intent::class.java,
+                Int::class.javaPrimitiveType,
+                Bundle::class.java
+            ).apply { isAccessible = true }
+        }.getOrNull()
+    }
+
+    private fun superExecStartActivity(
+        who: Context?,
+        contextThread: android.os.IBinder?,
+        token: android.os.IBinder?,
+        target: Activity?,
+        intent: Intent?,
+        requestCode: Int,
+        options: Bundle?
+    ): ActivityResult? {
+        val method = superExecMethod
+            ?: throw IllegalStateException("Instrumentation.execStartActivity no resoluble (exemptions degradadas)")
+        return method.invoke(this, who, contextThread, token, target, intent, requestCode, options) as? ActivityResult
     }
 
     override fun callActivityOnCreate(activity: Activity, icicle: Bundle?) {
