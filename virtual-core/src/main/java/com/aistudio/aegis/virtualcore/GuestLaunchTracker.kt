@@ -329,6 +329,65 @@ object GuestLaunchTracker {
     }
 
     /**
+     * RESUMEN GLOBAL (regla 3): tabla "clase de fallo x apps afectadas" con TODOS
+     * los clones, priorizada por nº de apps — se arregla primero la clase con más
+     * apps. Se persiste con fecha para comparar antes/después de cada cambio del
+     * motor (criterio de éxito: menos apps en la clase tras cada cambio).
+     */
+    fun buildGlobalSummary(appContext: Context): String {
+        val root = File(appContext.filesDir, "virtual_env")
+        data class Row(val pkg: String, val clase: String, val verdict: String, val fecha: String)
+        val rows = mutableListOf<Row>()
+        root.listFiles()?.filter { it.isDirectory }?.forEach { pkgDir ->
+            val latest = File(pkgDir, "reports/latest.txt")
+            if (!latest.exists()) return@forEach
+            val text = runCatching { latest.readText() }.getOrDefault("")
+            if (text.isBlank()) return@forEach
+            fun line(prefix: String): String =
+                text.lineSequence().firstOrNull { it.startsWith(prefix) }?.removePrefix(prefix)?.trim().orEmpty()
+            val pkg = line("app clonada:").substringBefore(" (").ifBlank { pkgDir.name }
+            val verdict = line("resultado:").ifBlank { "(sin resultado)" }
+            val declared = line("clase de fallo:")
+            val clase = declared.ifBlank {
+                // Informes antiguos sin clasificador: clasificar ahora con su texto.
+                FailureClassifier.clasificar(text, verdict).clase.name
+            }
+            val fecha = line("fecha:").ifBlank { "?" }
+            rows.add(Row(pkg, clase, verdict, fecha))
+        }
+        return buildString {
+            appendLine("=== AEGIS · RESUMEN GLOBAL (tabla clase de fallo x apps) ===")
+            appendLine("fecha: ${SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())}")
+            appendLine("(prioridad: primero la clase con más apps afectadas)")
+            appendLine()
+            val grouped = rows.groupBy { it.clase }.entries.sortedByDescending { it.value.size }
+            if (grouped.isEmpty()) {
+                appendLine("(sin informes todavía: lanzar clones y volver)")
+            }
+            for ((clase, apps) in grouped) {
+                appendLine("$clase (${apps.size} app${if (apps.size == 1) "" else "s"}):")
+                for (app in apps.sortedBy { it.pkg }) {
+                    appendLine("  · ${app.pkg} — ${app.verdict.take(90)} (${app.fecha})")
+                }
+                appendLine()
+            }
+            appendLine("== HISTORIAL ==")
+            appendLine("Guardar este archivo tras cada cambio del motor; el éxito es ver bajar la fila con más apps.")
+        }
+    }
+
+    /** Persiste el resumen global (latest + historial con fecha). Devuelve la ruta latest. */
+    fun persistGlobalSummary(appContext: Context): String? = runCatching {
+        val text = buildGlobalSummary(appContext)
+        val dir = File(appContext.filesDir, "virtual_env/summaries").apply { mkdirs() }
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        File(dir, "sumario_$stamp.txt").writeText(text)
+        val latest = File(dir, "resumen_global.txt")
+        latest.writeText(text)
+        latest.absolutePath
+    }.getOrNull()
+
+    /**
      * Genera el informe completo y lo persiste en el sandbox del host:
      *   files/virtual_env/<pkg>/reports/intento_<fecha>_p<pid>.txt  (+ latest.txt)
      * Devuelve la ruta del archivo generado. Cada intento queda en el historial.
@@ -378,6 +437,20 @@ object GuestLaunchTracker {
         sb.appendLine("app clonada: $guestPackage (versión $guestVersion)")
         sb.appendLine("host Aegis: $hostVersion · ${Build.MANUFACTURER} ${Build.MODEL} · Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT}) · ABI ${Build.SUPPORTED_ABIS.firstOrNull() ?: "?"}")
         sb.appendLine("(informe técnico del motor: sin cuentas ni contenido de la app)")
+        sb.appendLine()
+
+        // 1.b Clase de fallo — clasificador POR CAUSA RAÍZ (última Caused by),
+        // prohibido decidir por paquete. La línea "clase de fallo:" es parseable
+        // por el resumen global.
+        val diag = FailureClassifier.clasificar(
+            crashChain ?: snapshotExceptions().lastOrNull().orEmpty(),
+            verdict
+        )
+        sb.appendLine("clase de fallo: ${diag.clase}")
+        sb.appendLine("== CLASE DE FALLO (${diag.clase}) ==")
+        sb.appendLine("mecanismo: ${diag.mecanismo}")
+        sb.appendLine("causa raíz (literal, última Caused by): ${diag.causaRaiz}")
+        sb.appendLine("responsable del motor: ${diag.responsable}")
         sb.appendLine()
 
         // 2. Línea de tiempo ✔ / ✘ / no verificado, con el PRIMER FALLO marcado

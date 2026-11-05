@@ -70,6 +70,20 @@ fun AegisEngineApp(
         }
     }
 
+    // Regla 5: "Probar todos los clones" desde el resumen global relanza esta app
+    // con el extra test_all → secuencia de regresión sobre todos los clones.
+    androidx.compose.runtime.LaunchedEffect(Unit) {
+        val activity = context as? android.app.Activity
+        if (activity?.intent?.getBooleanExtra("test_all", false) == true) {
+            var waited = 0
+            while (viewModel.clonedApps.value.isEmpty() && waited < 5000) {
+                kotlinx.coroutines.delay(250); waited += 250
+            }
+            viewModel.testAllClonesSequentially()
+            runCatching { activity.intent.removeExtra("test_all") }
+        }
+    }
+
     // Mostrar diálogo modal de progreso o error cuando el motor está instalando, iniciando o si falló
     when (val state = uiState) {
         is UiState.Installing -> {
@@ -149,6 +163,15 @@ fun AegisEngineApp(
                 },
                 onDeleteClone = { app ->
                     viewModel.deleteClonedApp(app.info.packageName)
+                },
+                onTestAllClones = {
+                    viewModel.testAllClonesSequentially()
+                },
+                onOpenGlobalSummary = {
+                    context.startActivity(
+                        android.content.Intent(context, ReportActivity::class.java)
+                            .putExtra(ReportActivity.EXTRA_SUMMARY, true)
+                    )
                 }
             )
         }

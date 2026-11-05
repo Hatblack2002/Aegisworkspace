@@ -65,6 +65,8 @@ fun HomeScreen(
     onExploreFiles: (ClonedAppUiItem) -> Unit,
     onOpenReport: (ClonedAppUiItem) -> Unit,
     onDeleteClone: (ClonedAppUiItem) -> Unit,
+    onTestAllClones: () -> Unit = {},
+    onOpenGlobalSummary: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val navBarsBottom = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
@@ -156,6 +158,26 @@ fun HomeScreen(
                     )
                 },
                 testTag = "home_bottom_add_app_button",
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            // Regla 3/5 del diagnóstico global: resumen (tabla clase x apps) y
+            // prueba de regresión de todos los clones, uno a uno.
+            PillButton(
+                text = "Resumen global de fallos",
+                onClick = onOpenGlobalSummary,
+                isSecondary = true,
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            PillButton(
+                text = "Probar todos los clones",
+                onClick = onTestAllClones,
+                isSecondary = true,
                 modifier = Modifier.fillMaxWidth()
             )
         }

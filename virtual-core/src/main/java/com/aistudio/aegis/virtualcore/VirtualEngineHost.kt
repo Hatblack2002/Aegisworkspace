@@ -357,7 +357,26 @@ class VirtualEngineHost private constructor(private val appContext: Context) {
     /**
      * Virtual Activity Launcher: Abre la app clonada en pantalla completa dentro de su proceso stub aislado.
      */
+    /** Paquete del proceso stub activo — regla "un informe = un paquete = un PID". */
+    private var activeStubPackage: String = ""
+
     fun launchClonedAppFullscreenActivity(clonedApp: ClonedAppInfo) {
+        // Un informe = un paquete = un PID. Si el proceso stub activo sirve a OTRO
+        // paquete, se mata antes de lanzar: el informe del nuevo intento nunca mezcla
+        // pasos de dos invitados (antes: VPN y SBrowser compartieron el PID 2781 y
+        // sus informes quedaron entrelazados).
+        if (activeStubPackage != clonedApp.packageName) {
+            runCatching {
+                AegisReportProvider.reportsByPackage.value.forEach { (pkg, report) ->
+                    val pid = report.pid
+                    if (pkg != clonedApp.packageName && pid > 0 && pid != android.os.Process.myPid()) {
+                        android.os.Process.killProcess(pid)
+                        Log.i(TAG, "proceso stub de $pkg (pid=$pid) terminado antes de lanzar ${clonedApp.packageName}")
+                    }
+                }
+            }
+            activeStubPackage = clonedApp.packageName
+        }
         val activityClass = if (clonedApp.assignedProcess == ":p1") {
             StubProcessActivityP1::class.java
         } else {

@@ -10,11 +10,13 @@ import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import android.os.Build
+import android.util.Log
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.aistudio.aegis.virtualcore.ClonedAppInfo
+import com.aistudio.aegis.virtualcore.GuestLaunchTracker
 import com.aistudio.aegis.virtualcore.GuestMapsReport
 import com.aistudio.aegis.virtualcore.VirtualEngineHost
 import com.aistudio.aegis.virtualcore.VirtualFileNode
@@ -249,6 +251,34 @@ class AegisViewModel(application: Application) : AndroidViewModel(application) {
     fun launchFullscreenClonedApp(packageName: String) {
         val existing = _clonedApps.value.find { it.info.packageName == packageName }?.info ?: return
         engineHost.launchClonedAppFullscreenActivity(existing)
+    }
+
+    private var testAllRunning = false
+
+    /**
+     * Regla 5 — prueba de regresión: lanza cada clon UNO A UNO, espera el resultado
+     * (watchdog de pantalla blanca: 10s + margen) y deja su informe en el historial.
+     * La tabla global (Resumen global de fallos) se regenera al terminar.
+     * Un informe = un paquete = un PID (el host mata el proceso stub anterior).
+     */
+    fun testAllClonesSequentially() {
+        if (testAllRunning) return
+        val clones = _clonedApps.value.map { it.info }
+        if (clones.isEmpty()) return
+        testAllRunning = true
+        viewModelScope.launch {
+            try {
+                for (clone in clones) {
+                    Log.i("AegisViewModel", "Prueba de regresión: lanzando ${clone.packageName}")
+                    engineHost.launchClonedAppFullscreenActivity(clone)
+                    // Watchdog (10s) + margen para que el intento genere o falle informe.
+                    delay(15000)
+                }
+            } finally {
+                testAllRunning = false
+                GuestLaunchTracker.persistGlobalSummary(getApplication<Application>())
+            }
+        }
     }
 
 

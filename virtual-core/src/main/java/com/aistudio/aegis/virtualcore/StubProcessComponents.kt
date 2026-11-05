@@ -487,11 +487,19 @@ object GuestRuntimeEngine {
         }
         val optimizedDexDir = File(containerDir, "oat").apply { mkdirs() }
         return try {
+            // Regla AISLAMIENTO_CLASES: el padre del loader del invitado debe ser el
+            // BootClassLoader (padre del system), NO el classLoader de la app host.
+            // Con el host como padre, las clases androidx del host (otra versión)
+            // sombreaban a las del invitado: NoSuchMethodError getSavedStateRegistry
+            // (informe VPN p2781). Android.* sigue resolviendo en Boot ✓.
+            val bootParent: ClassLoader = runCatching {
+                ClassLoader.getSystemClassLoader().parent
+            }.getOrNull() ?: context.classLoader
             DexClassLoader(
                 dexClassPath,
                 optimizedDexDir.absolutePath,
                 nativeLibDir.absolutePath,
-                context.classLoader
+                bootParent
             ).also { loadersByPackage[packageName] = it }
         } catch (t: Throwable) {
             Log.w(TAG, "No se pudo crear DexClassLoader de $packageName: ${t.message}")
@@ -563,6 +571,13 @@ object GuestRuntimeEngine {
             // Publicar ANTES de construir el contexto de attach: así getApplicationContext()
             // del invitado devuelve SU Application y no el de Aegis (casteos rotos en SDKs).
             GuestSession.application = guestApp
+            // Regla CONTEXTO_APP: publicar la Application del invitado en el LoadedApk
+            // del proceso. ActivityThread.performLaunchActivity obtiene la Application
+            // via LoadedApk.makeApplication() -> si mApplication ya es la del guest, el
+            // attach() de TODA actividad recibe la Application correcta y el check
+            // "does not implement GeneratedComponentManager" (YouTube, informe p6754)
+            // desaparece. Requiere hidden API bypass (ya corregido).
+            publishProcessApplication(mainThreadContext, guestApp)
             val attachContext = buildGuestContext(mainThreadContext.applicationContext)
             val attachMethod = Application::class.java.getDeclaredMethod("attach", Context::class.java)
             attachMethod.isAccessible = true
@@ -592,6 +607,32 @@ object GuestRuntimeEngine {
             Log.w(TAG, "No se pudo alojar el Application de $packageName (no fatal): ${t.message}")
             null
         }
+    }
+
+    /**
+     * Publica [guestApp] como mApplication del LoadedApk del proceso stub. Con esto
+     * ContextImpl.getApplicationContext() y Activity.attach() devuelven la Application
+     * del invitado. Best-effort: si el campo cambia de nombre, se degrada sin romper.
+     */
+    private fun publishProcessApplication(mainThreadContext: Context, guestApp: Application): Boolean {
+        val published = runCatching {
+            HiddenApiExempt.exemptAll()
+            val impl = mainThreadContext.applicationContext
+            val loadedApk = impl.javaClass.getDeclaredField("mPackageInfo")
+                .apply { isAccessible = true }.get(impl)
+            loadedApk.javaClass.getDeclaredField("mApplication")
+                .apply { isAccessible = true }.set(loadedApk, guestApp)
+            true
+        }.getOrDefault(false)
+        if (published) {
+            GuestLaunchTracker.ok("Application del proceso", "LoadedApk.mApplication = ${guestApp.javaClass.name}")
+        } else {
+            GuestLaunchTracker.unverified(
+                "Application del proceso",
+                "no se pudo publicar en LoadedApk.mApplication — las actividades recibiran la Application del host en attach()"
+            )
+        }
+        return published
     }
 
     /** Lanza el Activity real del invitado a través del stub que corresponda a su launchMode. */
@@ -822,9 +863,27 @@ open class BaseStubProcessActivity(private val stubSuffix: String) : Activity() 
             GuestLaunchTracker.reset(packageName)
         }
 
-        // Crash handler nativo (SIGSEGV, SIGABRT) del invitado
+        // Crash handler nativo (SIGSEGV, SIGABRT) del invitado. El handler escribe
+        // un informe en disco ANTES de morir (regla SILENCIOSO: ningún proceso
+        // muere sin informe). Crashes nativos de intentos ANTERIORES del mismo
+        // paquete se registran aquí en el timeline de este intento.
         try {
             NativeGuestBridge.ensureLoaded()
+            val reportsDir = File(
+                File(filesDir, "virtual_env/$packageName/reports"),
+                "native_crash.txt"
+            ).apply { parentFile?.mkdirs() }
+            if (reportsDir.exists()) {
+                val previous = runCatching { reportsDir.readText() }.getOrDefault("")
+                if (previous.isNotBlank()) {
+                    GuestLaunchTracker.exception(
+                        IllegalStateException(previous.trim()),
+                        "crash NATIVO registrado por el handler de señales (intentos anteriores del mismo paquete)"
+                    )
+                }
+                reportsDir.delete()
+            }
+            NativeGuestBridge.nativeSetCrashReportPath(reportsDir.absolutePath)
             NativeGuestBridge.nativeInstallCrashHandler()
         } catch (_: Exception) {}
 

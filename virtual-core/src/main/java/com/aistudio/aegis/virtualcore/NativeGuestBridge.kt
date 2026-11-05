@@ -47,6 +47,9 @@ object NativeGuestBridge {
      */
     external fun nativeInstallCrashHandler()
 
+    /** Ruta donde el handler de señales escribe el informe nativo antes de morir. */
+    external fun nativeSetCrashReportPath(path: String)
+
     /**
      * Configuración explícita del VFS cooperativo en C++
      */
@@ -141,51 +144,29 @@ object NativeGuestBridge {
             }
         }
 
-        // Mapeo explícito de librerías del contenedor, por ORDEN DE DEPENDENCIAS.
-        // Regla A.7: no podemos leer DT_NEEDED sin un parser ELF completo, así que
-        // usamos el algoritmo genérico equivalente: repetir rondas de dlopen hasta
-        // que no quede progreso. En cada ronda se carga lo que ya tiene sus
-        // dependencias mapeadas (o no las necesita); lo que falla espera a la
-        // siguiente. Un dlopen que falla es un AVISO, nunca un error del intento.
+        // Regla del motor: el INSPECTOR NO hace dlopen de las .so del guest.
+        // El dlopen deliberado causaba SIGABRT nativo (señal 6) en juegos — el
+        // proceso moría antes de que ningún handler Java pudiera generar informe:
+        // "pantalla en blanco sin informe". Cada .so se cargará NATURALMENTE cuando
+        // el guest llame System.loadLibrary (el DexClassLoader tiene nativeLibraryDir
+        // apuntando al sandbox). Aquí solo se INVENTARIAN como aviso.
         preloadLibsDir?.let { dir ->
             if (dir.exists() && dir.isDirectory) {
-                val soFiles = dir.listFiles { file -> file.isFile && file.name.endsWith(".so") }
-                    .orEmpty()
-                    .sortedBy { it.name }
-                    .toMutableList()
-                Log.i(TAG, "Encontradas ${soFiles.size} librerías .so en el contenedor virtual de $packageName")
-                var round = 1
-                val finalErrors = mutableListOf<Pair<String, String>>()
-                while (soFiles.isNotEmpty()) {
-                    var progress = false
-                    val iterator = soFiles.iterator()
-                    while (iterator.hasNext()) {
-                        val soFile = iterator.next()
-                        val dlResult = runCatching { nativeDlopenLibrary(soFile.absolutePath) }
-                            .getOrElse { "EXCEPCIÓN: ${it.message}" }
-                        val loaded = !dlResult.contains("fail", ignoreCase = true) &&
-                            !dlResult.startsWith("EXCEPCIÓN") && !dlResult.startsWith("ERROR")
-                        if (loaded) {
-                            iterator.remove()
-                            progress = true
-                            Log.i(TAG, "Mapeo de librería guest ${soFile.name}: $dlResult (ronda $round)")
-                        } else {
-                            Log.i(TAG, "dlopen de ${soFile.name} pendiente (ronda $round): $dlResult")
-                            finalErrors.removeAll { it.first == soFile.name }
-                            finalErrors.add(soFile.name to (dlResult ?: "sin detalle"))
-                        }
+                val soFiles = dir.listFiles { file -> file.isFile && file.name.endsWith(".so") }.orEmpty()
+                val wrongAbi = soFiles.filter { so ->
+                    so.inputStream().use { input ->
+                        val header = ByteArray(5); input.read(header) == 5 &&
+                            header[4].toInt() == 1 // ELFCLASS32 en un proceso 64-bit
                     }
-                    if (!progress) break // nada más cargable: las restantes faltan por dependencia
-                    round++
                 }
-                if (soFiles.isNotEmpty()) {
-                    Log.w(TAG, "${soFiles.size} librerías sin mapear tras $round rondas (aviso, no error)")
+                Log.i(TAG, "Inventario de librerías guest (sin dlopen): ${soFiles.size} totales, ${wrongAbi.size} de otra ABI")
+                if (wrongAbi.isNotEmpty()) {
                     GuestLaunchTracker.exception(
                         IllegalStateException(
-                            "AVISO dlopen (no bloquea el intento): " +
-                                finalErrors.joinToString("; ") { (name, err) -> "$name → $err" }
+                            "AVISO ABI (no bloquea el intento): ${wrongAbi.size} .so del guest no son de la ABI del proceso: " +
+                                wrongAbi.take(8).joinToString(", ") { it.name }
                         ),
-                        "librerías .so del guest que quedaron sin cargar (orden de dependencias)"
+                        "librerías .so del guest con ABI distinta a la del proceso (se ignoran)"
                     )
                 }
             }

@@ -12,8 +12,8 @@ android {
     applicationId = "com.aistudio.aegisengine.vcore"
     minSdk = 26
     targetSdk = 36
-    versionCode = 6
-    versionName = "2.4-diag-global"
+    versionCode = 7
+    versionName = "2.5-clases-fallo"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }

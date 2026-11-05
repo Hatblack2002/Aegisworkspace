@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <ctime>
 #include <string>
 #include <vector>
 #include <set>
@@ -46,6 +47,11 @@ struct sigaction g_oldIll;
 struct sigaction g_oldFpe;
 bool g_crashHandlerInstalled = false;
 
+// Ruta (fijada desde Kotlin) donde el handler de señales escribe el informe del
+// crash nativo ANTES de que el proceso muera — sin esto los juegos mueren en
+// blanco y sin informe. Solo se usan syscalls async-signal-safe en el handler.
+char g_crashReportPath[512] = {0};
+
 void nativeCrashSignalHandler(int sig, siginfo_t* info, void* context) {
     const char* sigName = "UNKNOWN";
     switch (sig) {
@@ -59,6 +65,22 @@ void nativeCrashSignalHandler(int sig, siginfo_t* info, void* context) {
     void* faultAddr = info ? info->si_addr : nullptr;
     pid_t pid = getpid();
     LOGE("CRASH DETECTADO EN PROCESO STUB (PID=%d, SEÑAL=%d: %s, ADDR=%p)", pid, sig, sigName, faultAddr);
+
+    // Regla SILENCIOSO: ningún proceso muere sin dejar informe. Escribir con
+    // open/write/close (async-signal-safe) ANTES de morir; el siguiente intento
+    // del mismo paquete lo registra en el timeline como crash nativo previo.
+    if (g_crashReportPath[0] != '\0') {
+        int fd = open(g_crashReportPath, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            char buf[256];
+            int n = snprintf(buf, sizeof(buf),
+                "NATIVE_CRASH fecha=%lld pid=%d señal=%d (%s) addr=%p\n",
+                (long long)time(nullptr), pid, sig, sigName, faultAddr);
+            if (n > 0) write(fd, buf, (size_t)n);
+            close(fd);
+        }
+    }
+
     LOGE("Aegis Crash Sandbox aislando fallo: terminando únicamente el proceso stub :p0/:p1 para proteger Aegis Host.");
 
     // Terminar inmediatamente el proceso stub con _exit para no arrastrar al proceso anfitrión
@@ -154,6 +176,26 @@ JNI_OnLoad(JavaVM* vm, void* /*reserved*/) {
     }
     LOGI("libaegis_guest.so inicializada en proceso PID=%d (Modo cooperativo e instrumentación verificable)", getpid());
     return JNI_VERSION_1_6;
+}
+
+/**
+ * Fija la ruta del informe de crash nativo (desde Kotlin, antes de arrancar el
+ * guest). El handler de señales escribe ahí ANTES de morir: ningún proceso muere
+ * sin informe (regla SILENCIOSO).
+ */
+extern "C" JNIEXPORT void JNICALL
+Java_com_aistudio_aegis_virtualcore_NativeGuestBridge_nativeSetCrashReportPath(
+        JNIEnv* env,
+        jobject /*thiz*/,
+        jstring path) {
+    if (path == nullptr) return;
+    const char* p = env->GetStringUTFChars(path, nullptr);
+    if (p != nullptr) {
+        strncpy(g_crashReportPath, p, sizeof(g_crashReportPath) - 1);
+        g_crashReportPath[sizeof(g_crashReportPath) - 1] = '\0';
+        env->ReleaseStringUTFChars(path, p);
+        LOGI("Informe de crash nativo será escrito en: %s", g_crashReportPath);
+    }
 }
 
 /**

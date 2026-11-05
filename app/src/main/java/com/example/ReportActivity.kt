@@ -8,6 +8,8 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.MediaStore
 import android.widget.Toast
+import com.aistudio.aegis.virtualcore.GuestLaunchTracker
+import com.example.ui.components.PillButton
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -78,17 +80,112 @@ class ReportActivity : ComponentActivity() {
 
     companion object {
         const val EXTRA_PACKAGE = "extra_report_package"
+        const val EXTRA_SUMMARY = "extra_report_global_summary"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         val pkg = intent?.getStringExtra(EXTRA_PACKAGE).orEmpty()
+        val isGlobalSummary = intent?.getBooleanExtra(EXTRA_SUMMARY, false) == true
         setContent {
             AegisTheme {
-                ReportScreen(pkg = pkg)
+                if (isGlobalSummary) ReportSummaryScreen() else ReportScreen(pkg = pkg)
             }
         }
+    }
+}
+
+/**
+ * Resumen GLOBAL de fallos (regla 3): tabla "clase de fallo x apps afectadas"
+ * con todos los clones, priorizada — es la lista de prioridades de arreglos.
+ * Regla 5: el botón "Probar todos los clones" lanza el test de regresión.
+ */
+@Composable
+fun ReportSummaryScreen() {
+    val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+    var reloadKey by remember { mutableStateOf(0) }
+    val summary = remember(reloadKey) {
+        GuestLaunchTracker.buildGlobalSummary(context.applicationContext)
+    }
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(AegisBackground)
+            .statusBarsPadding()
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Text(
+            text = "Resumen global de fallos",
+            color = AegisOnSurface,
+            fontWeight = FontWeight.Bold,
+            fontSize = 20.sp
+        )
+        Text(
+            text = "Tabla clase de fallo × apps afectadas (prioridad: la clase con más apps se arregla primero)",
+            color = AegisOnSurfaceVariant,
+            fontSize = 13.sp
+        )
+        SelectionContainer {
+            LazyColumn(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .background(AegisOnSurface.copy(alpha = 0.06f), RoundedCornerShape(12.dp))
+            ) {
+                items(summary.lines()) { line ->
+                    Text(
+                        text = line.ifBlank { " " },
+                        color = AegisOnSurface,
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 12.sp,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 1.dp)
+                    )
+                }
+            }
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            PillButton(
+                text = "Copiar resumen",
+                onClick = {
+                    clipboard.setText(AnnotatedString(summary))
+                    Toast.makeText(context, "Resumen copiado", Toast.LENGTH_SHORT).show()
+                },
+                modifier = Modifier.weight(1f)
+            )
+            PillButton(
+                text = "Guardar",
+                isSecondary = true,
+                onClick = {
+                    val path = GuestLaunchTracker.persistGlobalSummary(context.applicationContext)
+                    Toast.makeText(
+                        context,
+                        if (path != null) "Guardado en el historial ($path)" else "No se pudo guardar",
+                        Toast.LENGTH_LONG
+                    ).show()
+                    reloadKey++
+                },
+                modifier = Modifier.weight(1f)
+            )
+        }
+        PillButton(
+            text = "Probar todos los clones",
+            onClick = {
+                // Regla 5: prueba de regresión — relanza la app principal en modo
+                // testAll: lanza cada clon uno a uno, espera su resultado (watchdog
+                // de 10s + margen) y regenera esta tabla al final.
+                val launch = runCatching {
+                    context.packageManager.getLaunchIntentForPackage(context.packageName)
+                }.getOrNull()
+                if (launch != null) {
+                    launch.putExtra("test_all", true)
+                    launch.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                    context.startActivity(launch)
+                }
+            }
+        )
     }
 }
 

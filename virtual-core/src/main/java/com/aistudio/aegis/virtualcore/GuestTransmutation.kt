@@ -123,9 +123,27 @@ object GuestActivityTransmuter {
         }.getOrNull()
         if (realInfo != null) {
             runCatching { activityField("mActivityInfo").set(activity, realInfo) }
-            if (realInfo.theme != 0) {
-                runCatching { activity.setTheme(realInfo.theme) }
+            val themeRes = realInfo.theme.takeIf { it != 0 }
+                ?: GuestSession.appInfo?.theme?.takeIf { it != 0 }
+            if (themeRes != null) {
+                runCatching {
+                    activity.setTheme(themeRes)
+                    GuestLaunchTracker.ok(
+                        "Theme del guest",
+                        "0x${Integer.toHexString(themeRes)} aplicado a $guestClassName (antes del onCreate, AppCompat lo lee en lazy)"
+                    )
+                }
+            } else {
+                GuestLaunchTracker.unverified(
+                    "Theme del guest",
+                    "ni la actividad ni la aplicación declaran android:theme en el manifest del guest"
+                )
             }
+        } else {
+            GuestLaunchTracker.unverified(
+                "Theme del guest",
+                "ActivityInfo del guest no resoluble en el PackageManager del host — theme del manifest no aplicado"
+            )
         }
         Log.i(TAG, "actividad invitado preparada: $guestClassName")
 
@@ -258,6 +276,36 @@ class AegisInstrumentation : Instrumentation() {
         return super.newActivity(cl, className, intent)
     }
 
+    /**
+     * Regla IDENTIDAD_PERMISOS: Activity.startActivityForResult NO pasa por el Context
+     * virtual (llama a Instrumentation.execStartActivity directamente). Sin esta
+     * intercepción, cualquier pantalla interna que el guest abre desde su onCreate
+     * llega al AMS con el componente del guest -> "not exported from uid" (crash de
+     * MyFiles, informe p3530). Toda salida del guest se reescribe a un stub del host
+     * llevando el componente real en extras — genérico, sin código por paquete.
+     */
+    override fun execStartActivity(
+        who: Context?,
+        contextThread: android.os.IBinder?,
+        token: android.os.IBinder?,
+        target: Activity?,
+        intent: Intent?,
+        requestCode: Int,
+        options: Bundle?
+    ): ActivityResult? {
+        val guestPkg = GuestSession.packageName
+        val comp = intent?.component
+        if (intent != null && guestPkg.isNotBlank() && comp?.packageName == guestPkg) {
+            val stub = comp.className?.let { stubActivityNameFor(it) }
+                ?: "com.aistudio.aegis.virtualcore.StubProcessActivityP0"
+            intent.component = ComponentName(GuestSession.hostPackage.ifBlank { guestPkg }, stub)
+            intent.putExtra(GuestRuntimeEngine.EXTRA_GUEST_CLASS, comp.className)
+            intent.putExtra(GuestRuntimeEngine.EXTRA_PACKAGE_NAME, guestPkg)
+            AegisLog.i("execStartActivity enrutado: ${comp.className} -> $stub")
+        }
+        return super.execStartActivity(who, contextThread, token, target, intent, requestCode, options)
+    }
+
     override fun callActivityOnCreate(activity: Activity, icicle: Bundle?) {
         trackedOnCreate(activity, icicle, null, withPersistent = false)
     }
@@ -362,12 +410,17 @@ object HiddenApiExempt {
                 vmRuntimeClass, *arrayOf<Any?>("getRuntime", arrayOf<Class<*>>())
             ) as java.lang.reflect.Method
             val setExemptions = meta.invoke(
-                vmRuntimeClass, *arrayOf<Any?>("setHiddenApiExemptions", Array<String>::class.java)
+                // BUG corregido: el parámetro 2 de Class.getDeclaredMethod es Class[]
+                // (los TIPOS de cada parámetro). String[].class suelto era rechazado por
+                // ART ("got java.lang.Class<java.lang.String[]>") y POR ESO las exemptions
+                // nunca se instalaban: todas las apps con APIs ocultas (juegos, SDKs)
+                // degradaban a pantalla en blanco. String[].class va ENVUELTO en Class[].
+                vmRuntimeClass, *arrayOf<Any?>("setHiddenApiExemptions", arrayOf<Class<*>>(Array<String>::class.java))
             ) as java.lang.reflect.Method
             val vmRuntime = getRuntime.invoke(null)
             setExemptions.invoke(vmRuntime, *arrayOf<Any?>(arrayOf("L")))
             exempted = true
-            Log.i(TAG, "Hidden API exemptions instaladas (prefix L)")
+            Log.i(TAG, "exemptions OK — Hidden API exemptions instaladas (prefix L)")
             true
         } catch (failure: Throwable) {
             lastFailure = "${failure.javaClass.simpleName}: ${failure.message}"
